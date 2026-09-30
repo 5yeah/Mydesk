@@ -1,9 +1,9 @@
 # -*- coding: utf-8 -*-
 """MyDesk 被控端 (服务端)
 
-阶段1: TCP 监听 + 密码认证 + 心跳
-阶段2: 屏幕流推送 (mss 捕获 + JPEG 传输)
-阶段3: 键鼠事件执行 (Win32 SendInput)
+阶段1: TCP 监听 + 挑战-响应认证 + 心跳(RTT回显) + 认证限流
+阶段2: 屏幕流推送 (mss 捕获 + JPEG 传输, 共享广播器)
+阶段3: 键鼠事件执行 (Win32 SendInput, 虚拟桌面坐标系)
 阶段4: 文件传输 (双向 + 断点续传)
 阶段5: 多客户端共享屏幕广播 (多人同时连接同一台设备)
 
@@ -12,17 +12,23 @@
 键鼠事件加锁排队执行, 避免冲突。
 """
 import os
+import hmac as _hmac
 import select
 import socket
 import threading
 import time
 import datetime
 from protocol import (
-    send_msg, recv_msg, hash_password,
+    send_msg, recv_msg,
     MSG_AUTH, MSG_HEARTBEAT, MSG_SCREEN, MSG_INPUT, MSG_FILE, MSG_CONTROL,
     MSG_CLIPBOARD,
+    AUTH_V2_REQ, AUTH_V2_CHALLENGE, AUTH_V2_RESPONSE, AUTH_OK, AUTH_FAIL,
+    make_nonce, auth_response,
+    CTL_QUALITY, CTL_FPS, CTL_CLIPBOARD, CTL_PAUSE, CTL_RESUME, CTL_DEVICE_ID_QUERY,
+    CTL_SCREEN_INFO_REQ,
 )
-from config import get_device_id, get_password, get_port, get_discovery_port
+from config import (get_device_id, get_password, get_port, get_discovery_port,
+                    CONFIG_FILE, load_config)
 from screen_broadcaster import ScreenBroadcaster
 from input_control import handle_input
 from file_transfer import FileTransfer
@@ -32,8 +38,17 @@ import clipboard_win
 LOG_DIR = os.path.join(os.path.expanduser('~'), 'MyDesk_Logs')
 os.makedirs(LOG_DIR, exist_ok=True)
 
+# 认证限流参数 (个人自用场景取"温和"值: 允许几次手误, 之后逐次小幅延迟)
+AUTH_MAX_FAILURES = 5        # 前 5 次失败不延迟
+AUTH_MAX_DELAY = 5.0         # 单次认证失败后的最大延迟(秒)
+AUTH_FAIL_WINDOW = 300.0     # 计数窗口(秒), 窗口内无失败则清零
+
+# socket 发送超时(秒): 防止慢/死客户端把发送线程永久挂住
+SEND_TIMEOUT = 15
+
+
 def _debug_log(msg):
-    """写入调试日志文件"""
+    """写入调试日志文件 (严禁在逐帧路径调用)"""
     try:
         log_file = os.path.join(LOG_DIR, 'controlled_debug.log')
         timestamp = datetime.datetime.now().strftime('%H:%M:%S.%f')[:-3]
@@ -41,6 +56,7 @@ def _debug_log(msg):
             f.write(f'[{timestamp}] {msg}\n')
     except Exception:
         pass
+
 
 # 全局输入锁: 多客户端的键鼠事件排队执行, 避免冲突
 _input_lock = threading.Lock()
@@ -52,23 +68,34 @@ class Controlled:
         self.password = password or get_password()
         self.port = port or get_port()
         self.device_id = get_device_id()
-        self.recv_dir = recv_dir or os.path.join(os.path.expanduser('~'), 'Desktop', 'MyDesk_接收')
+        self.recv_dir = recv_dir or os.path.join(
+            os.path.expanduser('~'), 'Desktop', 'MyDesk_接收')
         os.makedirs(self.recv_dir, exist_ok=True)
         self.on_log = on_log or print
-        self.max_clients = max_clients  # 最大并发连接数
+        self.max_clients = max_clients  # 最大并发连接数(含未认证连接)
         self.running = False
         self.server = None
         self._discover_sock = None
-        self._clients = []          # [(conn, addr, client_id)]
+        self._clients = []          # 已认证: [(conn, addr, client_id)]
         self._lock = threading.Lock()
         self._client_counter = 0
+        self._conn_count = 0        # 活跃处理线程数(含认证中)
         self._broadcaster = None
+        # 密码: 构造时显式传入则固定使用(测试/命令行场景);
+        # 否则从 config.json 读取, 并按文件 mtime 热加载 —— 改密码无需重启即可生效
+        self._explicit_password = password
+        self._pwd_cache = password if password is not None else get_password()
+        self.password = self._pwd_cache
+        self._pwd_mtime = None
+        self._pwd_lock = threading.Lock()
+        # 认证失败计数: ip -> [次数, 最后失败时间]
+        self._auth_failures = {}
         # 剪贴板同步状态 (按客户端开关)
-        self._clip_sync_clients = set()   # 已开启剪贴板同步的 client_id
-        self._clip_send_fns = {}          # client_id -> safe_send
+        self._clip_sync_clients = set()
+        self._clip_send_fns = {}
         self._clip_lock = threading.Lock()
-        self._clip_last_text = None       # 最近一次观察/写入的剪贴板文本
-        self._clip_thread = None          # 剪贴板轮询线程
+        self._clip_last_text = None
+        self._clip_thread = None
 
     # ---------- 生命周期 ----------
     def start(self):
@@ -82,9 +109,9 @@ class Controlled:
                 _debug_log('[被控端] ScreenBroadcaster.start() 返回 False')
         except Exception as e:
             self.on_log(f'[被控端] 屏幕广播器启动异常: {e}')
-            _debug_log(f'[被控端] ScreenBroadcaster.start() 异常: {e}')
             import traceback
-            _debug_log(traceback.format_exc())
+            _debug_log(f'[被控端] ScreenBroadcaster.start() 异常: {e}\n'
+                       f'{traceback.format_exc()}')
 
         # 自动检测端口冲突, 选择可用端口
         self.port = self._find_available_port(self.port)
@@ -93,7 +120,7 @@ class Controlled:
         self.server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         self.server.bind(('0.0.0.0', self.port))
-        self.server.listen(self.max_clients)
+        self.server.listen(max(1, self.max_clients))
         # UDP 设备发现: 绑定到固定的发现端口(与可变 TCP 端口解耦),
         # 这样即使 TCP 端口漂移, 主控端仍能发现并拿到真实端口。
         self._discover_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -105,7 +132,7 @@ class Controlled:
         self._discover_sock.settimeout(1.0)
         disc_thread = threading.Thread(target=self._discover_loop, daemon=True)
         disc_thread.start()
-        self.on_log(f'[被控端] 设备ID={self.device_id} 密码={self.password} 端口={self.port}')
+        self.on_log(f'[被控端] 设备ID={self.device_id} 端口={self.port}')
         self.on_log(f'[被控端] 最大连接数={self.max_clients} 接收目录={self.recv_dir}')
         self.on_log('[被控端] 等待连接...')
         while self.running:
@@ -120,9 +147,9 @@ class Controlled:
                 _debug_log(f'[被控端] accept 瞬时异常(忽略并继续监听): {e}')
                 time.sleep(0.05)
                 continue
-            # 检查连接数限制
+            # 连接数限制: 未认证的连接也占用名额, 防止连接耗尽
             with self._lock:
-                current = len(self._clients)
+                current = self._conn_count
             if current >= self.max_clients:
                 self.on_log(f'[被控端] 拒绝 {addr[0]} (已达上限 {self.max_clients})')
                 try:
@@ -130,6 +157,8 @@ class Controlled:
                 except Exception:
                     pass
                 continue
+            with self._lock:
+                self._conn_count += 1
             self.on_log(f'[被控端] 连接来自 {addr[0]}:{addr[1]}')
             t = threading.Thread(target=self._handle_client, args=(conn, addr), daemon=True)
             t.start()
@@ -140,18 +169,17 @@ class Controlled:
         while self.running:
             try:
                 data, addr = self._discover_sock.recvfrom(1024)
-                received_id = data.decode('utf-8')
+                received_id = data.decode('utf-8', errors='ignore')
                 if received_id.upper() == self.device_id.upper():
                     # 响应格式: "device_id|port"  (主控端需要知道实际TCP端口)
                     response = f"{self.device_id}|{self.port}".encode('utf-8')
                     self._discover_sock.sendto(response, addr)
-                    self.on_log(f'[发现] 响应来自 {addr[0]} 的设备查询 (ID={received_id})')
             except socket.timeout:
                 continue
             except OSError:
                 break
             except Exception as e:
-                self.on_log(f'[发现] 异常: {e}')
+                _debug_log(f'[发现] 异常: {e}')
                 continue
 
     def stop(self):
@@ -161,9 +189,23 @@ class Controlled:
                 self._discover_sock.close()
             except Exception:
                 pass
+            self._discover_sock = None
         if self.server:
             try:
                 self.server.close()
+            except Exception:
+                pass
+            self.server = None
+        # 主动关闭所有客户端连接, 让处理线程及时退出
+        with self._lock:
+            conns = [c for c, _a, _cid in self._clients]
+        for c in conns:
+            try:
+                c.shutdown(socket.SHUT_RDWR)
+            except Exception:
+                pass
+            try:
+                c.close()
             except Exception:
                 pass
         if self._broadcaster:
@@ -179,7 +221,11 @@ class Controlled:
 
     def _find_available_port(self, start_port):
         """从 start_port 开始, 找一个可用的 TCP 端口 (UDP 发现端口已固定, 单独处理)"""
+        disc = get_discovery_port()
         for port in range(start_port, start_port + 20):
+            if port == disc:
+                # 跳过固定的 UDP 发现端口, 避免 TCP/UDP 端口号撞车造成排查混乱
+                continue
             try:
                 s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
                 # 不使用 SO_REUSEADDR, 确保能真实检测到端口占用
@@ -190,7 +236,7 @@ class Controlled:
             if port != start_port:
                 self.on_log(f'[被控端] 端口 {start_port} 已被占用, 使用 {port}')
             return port
-        self.on_log(f'[被控端] 警告: 端口 {start_port}-{start_port+19} 均被占用')
+        self.on_log(f'[被控端] 警告: 端口 {start_port}-{start_port + 19} 均被占用')
         return start_port
 
     @staticmethod
@@ -206,6 +252,72 @@ class Controlled:
                 conn.ioctl(socket.SIO_KEEPALIVE_VALS, (1, 10000, 3000))
         except Exception as e:
             _debug_log(f'[被控端] 设置 keepalive 参数失败: {e}')
+        # 发送超时: 客户端不读数据时不要永久阻塞发送线程
+        try:
+            import struct as _struct
+            conn.setsockopt(socket.SOL_SOCKET, socket.SO_SNDTIMEO,
+                            _struct.pack('<i', int(SEND_TIMEOUT * 1000)))
+        except Exception as e:
+            _debug_log(f'[被控端] 设置发送超时失败: {e}')
+
+    # ---------- 认证限流 ----------
+    def _current_password(self):
+        """返回当前生效密码。
+
+        - 构造时显式传入密码 -> 固定使用该密码(不再读配置文件)
+        - 未显式传入 -> 读 config.json, 且文件变更时自动热加载
+        """
+        if self._explicit_password is not None:
+            with self._pwd_lock:
+                return self._pwd_cache
+        try:
+            mtime = os.path.getmtime(CONFIG_FILE)
+        except OSError:
+            with self._pwd_lock:
+                return self._pwd_cache
+        with self._pwd_lock:
+            if mtime != self._pwd_mtime:
+                self._pwd_mtime = mtime
+                try:
+                    self._pwd_cache = get_password()
+                    self.password = self._pwd_cache
+                except Exception:
+                    pass
+            return self._pwd_cache
+
+    def set_password(self, pwd):
+        """运行时直接改密码 (不写配置文件)"""
+        with self._pwd_lock:
+            self._pwd_cache = pwd
+            self.password = pwd
+            self._explicit_password = pwd
+
+    def _auth_delay(self, ip):
+        """返回本次认证失败后应延迟的秒数 (指数退避)"""
+        now = time.time()
+        with self._lock:
+            rec = self._auth_failures.get(ip)
+            if rec and now - rec[1] > AUTH_FAIL_WINDOW:
+                rec = None
+            count = (rec[0] if rec else 0) + 1
+            self._auth_failures[ip] = [count, now]
+            # 防止字典无界增长
+            if len(self._auth_failures) > 512:
+                for k in [k for k, v in self._auth_failures.items()
+                          if now - v[1] > AUTH_FAIL_WINDOW]:
+                    self._auth_failures.pop(k, None)
+        if count <= AUTH_MAX_FAILURES:
+            return 0.0
+        return min(AUTH_MAX_DELAY, 0.5 * (2 ** (count - AUTH_MAX_FAILURES - 1)))
+
+    def _auth_ok(self, ip):
+        with self._lock:
+            self._auth_failures.pop(ip, None)
+
+    def _auth_failure_count(self, ip):
+        with self._lock:
+            rec = self._auth_failures.get(ip)
+            return rec[0] if rec else 0
 
     # ---------- 客户端处理 ----------
     def _handle_client(self, conn, addr):
@@ -225,87 +337,115 @@ class Controlled:
             self._client_counter += 1
             client_id = f'{addr[0]}#{self._client_counter}'
 
-        _debug_log(f'[被控端] 新连接: {addr[0]}:{addr[1]}, client_id={client_id}')
-        self.on_log(f'[被控端] 新连接: {addr[0]}:{addr[1]}, client_id={client_id}')
-
+        authed = False
         try:
-            conn.settimeout(5)  # 认证超时 (缩短到5秒)
+            conn.settimeout(5)  # 认证超时
             msg = recv_msg(conn)
             if msg is None:
                 self.on_log(f'[被控端] [{client_id}] 认证阶段: 对端关闭连接')
                 return
-            
             mtype, payload = msg
-            _debug_log(f'[被控端] 收到认证请求: mtype={mtype}')
-            
-            # 处理设备ID查询 (认证前, 用于TCP发现)
-            if mtype == MSG_CONTROL and payload == b'DEVICE_ID_QUERY':
+
+            # 处理设备ID查询 (认证前, 用于局域网 TCP 兜底发现)
+            if mtype == MSG_CONTROL and payload == CTL_DEVICE_ID_QUERY.encode('utf-8'):
                 try:
                     send_msg(conn, MSG_CONTROL, self.device_id.encode('utf-8'))
-                    self.on_log(f'[被控端] [{client_id}] 响应设备ID查询: {self.device_id}')
                 except Exception:
                     pass
-                conn.close()
                 return
-            
-            if mtype != MSG_AUTH or payload != hash_password(self.password):
+
+            # ---- 挑战-响应认证 (v2) ----
+            if mtype != MSG_AUTH or not payload or payload[0] != AUTH_V2_REQ \
+                    or len(payload) < 1 + 16:
                 try:
-                    send_msg(conn, MSG_AUTH, b'\x00')
+                    send_msg(conn, MSG_AUTH, AUTH_FAIL)
+                except Exception:
+                    pass
+                self.on_log(f'[被控端] [{client_id}] {addr[0]} 认证失败 (协议不匹配)')
+                return
+            client_nonce = payload[1:1 + 16]
+
+            server_nonce = make_nonce()
+            try:
+                send_msg(conn, MSG_AUTH, bytes([AUTH_V2_CHALLENGE]) + server_nonce)
+            except Exception as e:
+                self.on_log(f'[被控端] [{client_id}] 发送挑战失败: {e}')
+                return
+
+            msg = recv_msg(conn)
+            if msg is None:
+                return
+            mtype, payload = msg
+            password = self._current_password()
+            expected = auth_response(password, client_nonce, server_nonce)
+            got = payload[1:] if (mtype == MSG_AUTH and payload
+                                  and payload[0] == AUTH_V2_RESPONSE) else b''
+
+            # 定长比较, 避免时序侧信道
+            if not _hmac.compare_digest(got, expected):
+                delay = self._auth_delay(addr[0])
+                if delay:
+                    _debug_log(f'[被控端] [{client_id}] 认证失败延迟 {delay:.1f}s '
+                               f'(该IP累计失败 {self._auth_failure_count(addr[0])} 次)')
+                    time.sleep(delay)
+                try:
+                    send_msg(conn, MSG_AUTH, AUTH_FAIL)
                 except Exception:
                     pass
                 self.on_log(f'[被控端] [{client_id}] {addr[0]} 认证失败 (密码错误)')
                 return
+
+            self._auth_ok(addr[0])
             try:
-                send_msg(conn, MSG_AUTH, b'\x01')
+                send_msg(conn, MSG_AUTH, AUTH_OK)
             except Exception as e:
                 self.on_log(f'[被控端] [{client_id}] 发送认证响应失败: {e}')
                 return
+            authed = True
             conn.settimeout(None)
             # 认证通过后开启 TCP keepalive: 客户端崩溃/断网(半开连接)时能尽快
             # 侦测到并回收连接名额, 避免占满 max_clients 导致"后续连不上"。
             self._set_keepalive(conn)
             with self._lock:
                 self._clients.append((conn, addr, client_id))
-            count = len(self._clients)
+                count = len(self._clients)
             self.on_log(f'[被控端] [{client_id}] {addr[0]} 认证成功 (当前 {count} 人在线)')
-            _debug_log(f'[被控端] 认证成功, 准备订阅屏幕广播')
 
             # 文件传输管理器
             ft = FileTransfer(safe_send, self.recv_dir,
                               on_log=lambda m: self.on_log(f'[被控端] [{client_id}] {m}'))
             # 订阅共享屏幕广播
-            _debug_log(f'[被控端] 调用 subscribe, broadcaster存在={self._broadcaster is not None}')
             if self._broadcaster and self._broadcaster.running:
                 try:
                     self._broadcaster.subscribe(client_id, safe_send)
-                    _debug_log(f'[被控端] subscribe 完成')
                 except Exception as e:
                     _debug_log(f'[被控端] subscribe 异常: {e}')
                     self.on_log(f'[被控端] [{client_id}] 屏幕订阅失败: {e}')
             else:
-                _debug_log(f'[被控端] 屏幕广播器未运行，跳过订阅')
                 self.on_log(f'[被控端] [{client_id}] 屏幕广播器未就绪，将在屏幕就绪后自动推送')
             self._message_loop(conn, addr, client_id, ft, safe_send)
         except Exception as e:
-            _debug_log(f'[被控端] 异常: {e}')
+            import traceback
+            _debug_log(f'[被控端] 异常: {e}\n{traceback.format_exc()}')
             self.on_log(f'[被控端] [{client_id}] 异常: {e}')
         finally:
             with self._lock:
                 self._clients = [(c, a, cid) for c, a, cid in self._clients if c is not conn]
-            # 取消剪贴板同步注册
+                self._conn_count = max(0, self._conn_count - 1)
+                count = len(self._clients)
             with self._clip_lock:
                 self._clip_sync_clients.discard(client_id)
                 self._clip_send_fns.pop(client_id, None)
-            # 取消屏幕订阅
             if self._broadcaster:
-                self._broadcaster.unsubscribe(client_id)
+                # 已认证的才订阅过, 未认证的连接没有订阅, 不必触发订阅日志
+                if authed:
+                    self._broadcaster.unsubscribe(client_id)
             try:
                 conn.close()
             except Exception:
                 pass
-            with self._lock:
-                count = len(self._clients)
-            self.on_log(f'[被控端] [{client_id}] 断开 (剩余 {count} 人在线)')
+            if authed:
+                self.on_log(f'[被控端] [{client_id}] 断开 (剩余 {count} 人在线)')
 
     def _message_loop(self, conn, addr, client_id, ft, send_fn):
         """认证后消息分发循环
@@ -335,20 +475,9 @@ class Controlled:
                 break
             mtype, payload = msg
             if mtype == MSG_HEARTBEAT:
-                try:
-                    send_fn(MSG_HEARTBEAT)
-                except Exception:
-                    break
+                # 原样回显载荷, 让主控端算出真实 RTT
+                send_fn(MSG_HEARTBEAT, payload)
             elif mtype == MSG_CONTROL:
-                # 设备ID查询 (用于TCP发现, 认证前也能响应)
-                try:
-                    cmd = payload.decode('utf-8')
-                    if cmd == 'DEVICE_ID_QUERY':
-                        send_fn(MSG_CONTROL, self.device_id.encode('utf-8'))
-                        self.on_log(f'[被控端] [{client_id}] 响应设备ID查询')
-                        continue
-                except Exception:
-                    pass
                 self._handle_control(payload, client_id, send_fn)
             elif mtype == MSG_INPUT:
                 # 加锁排队执行, 避免多客户端同时操作冲突
@@ -368,20 +497,40 @@ class Controlled:
                         pass
             elif mtype == MSG_CLIPBOARD:
                 self._on_clipboard_receive(client_id, payload)
-            # MSG_SCREEN 被控端不接收, 忽略
+            # MSG_SCREEN / MSG_CURSOR 被控端不接收, 忽略
 
     def _handle_control(self, payload, client_id=None, send_fn=None):
-        """处理主控端控制指令: 画质/帧率/剪贴板开关"""
+        """处理主控端控制指令: 画质/帧率/剪贴板开关/暂停"""
         try:
             cmd = payload.decode('utf-8')
-            if cmd.startswith('QUALITY:'):
-                self._broadcaster.set_quality(int(cmd.split(':')[1]))
-            elif cmd.startswith('FPS:'):
-                self._broadcaster.set_fps(int(cmd.split(':')[1]))
-            elif cmd.startswith('CLIPBOARD:'):
-                self._set_clipboard_sync(cmd.split(':')[1] == 'on', client_id, send_fn)
         except Exception:
-            pass
+            _debug_log('[被控端] 控制指令解码失败')
+            return
+        try:
+            if cmd.startswith(CTL_QUALITY):
+                self._broadcaster.set_quality(int(cmd.split(':', 1)[1]))
+            elif cmd.startswith(CTL_FPS):
+                self._broadcaster.set_fps(int(cmd.split(':', 1)[1]))
+            elif cmd.startswith(CTL_CLIPBOARD):
+                self._set_clipboard_sync(cmd.split(':', 1)[1] == 'on', client_id, send_fn)
+            elif cmd == CTL_PAUSE:
+                self._broadcaster.set_paused(client_id, True)
+                self.on_log(f'[被控端] [{client_id}] 画面推送已暂停')
+            elif cmd == CTL_RESUME:
+                self._broadcaster.set_paused(client_id, False)
+                self.on_log(f'[被控端] [{client_id}] 画面推送已恢复')
+            elif cmd == CTL_DEVICE_ID_QUERY:
+                if send_fn:
+                    send_fn(MSG_CONTROL, self.device_id.encode('utf-8'))
+            elif cmd == CTL_SCREEN_INFO_REQ:
+                # 主控端窗口就绪后主动索要, 解决"显示器信息先于窗口到达被丢弃"
+                if client_id and self._broadcaster:
+                    self._broadcaster.resend_screen_info(client_id)
+            else:
+                _debug_log(f'[被控端] 未知控制指令: {cmd!r}')
+        except Exception as e:
+            # 以前这里静默 pass, 导致 PAUSE 之类的指令不生效却毫无线索
+            _debug_log(f'[被控端] 控制指令处理失败 cmd={cmd!r}: {e}')
 
     # ---------- 剪贴板同步 ----------
     def _set_clipboard_sync(self, enabled, client_id, send_fn):
@@ -398,7 +547,8 @@ class Controlled:
             self._clip_thread = threading.Thread(
                 target=self._clipboard_monitor, daemon=True)
             self._clip_thread.start()
-        self.on_log(f'[被控端] [{client_id}] 剪贴板同步={"开" if enabled else "关"}')
+        if client_id:
+            self.on_log(f'[被控端] [{client_id}] 剪贴板同步={"开" if enabled else "关"}')
 
     def _clipboard_monitor(self):
         """轮询被控端本机剪贴板, 变化时推送给已开启同步的客户端"""
@@ -435,7 +585,6 @@ class Controlled:
             clipboard_win.set_text(text)
             with self._clip_lock:
                 self._clip_last_text = text  # 防止轮询线程回环推送
-            self.on_log(f'[被控端] [{client_id}] 收到剪贴板 ({len(text)} 字符)')
         except Exception as e:
             _debug_log(f'[剪贴板] 设置本机剪贴板失败: {e}')
 
@@ -468,7 +617,7 @@ if __name__ == '__main__':
         if idx + 1 < len(args):
             from config import set_password
             set_password(args[idx + 1])
-            print(f'[被控端] 密码已设置为 {args[idx + 1]}')
+            print('[被控端] 密码已更新 (正在运行的实例会自动生效)')
         sys.exit(0)
     if '--set-max-clients' in args:
         idx = args.index('--set-max-clients')
@@ -498,11 +647,7 @@ if __name__ == '__main__':
                 except ValueError:
                     pass
 
-    # 读取最大连接数配置
-    from config import load_config
-    max_clients = load_config().get('max_clients', 5)
-
-    app = Controlled(pwd, port, max_clients=max_clients)
+    app = Controlled(pwd, port, max_clients=load_config().get('max_clients', 5))
     try:
         app.start()
     except KeyboardInterrupt:

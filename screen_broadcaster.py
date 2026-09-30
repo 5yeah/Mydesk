@@ -7,8 +7,11 @@ ScreenBroadcaster:
   - 一个 mss 实例 + 多个捕获线程 (每个显示器一个)
   - 每帧编码后, 同时推送给所有订阅的客户端
   - 客户端断开时自动取消订阅
+  - 支持按客户端暂停推送 (PAUSE/RESUME)
   - 屏幕帧格式: [屏幕索引 4字节][JPEG数据]
+  - 显示器信息格式: SCREEN:{idx}:{w}x{h}:{left}:{top}   (left/top 为虚拟桌面偏移)
 """
+import ctypes
 import io
 import struct
 import threading
@@ -17,14 +20,20 @@ import os
 import datetime
 import mss
 from PIL import Image
-from protocol import MSG_SCREEN, MSG_CONTROL
+from protocol import MSG_SCREEN, MSG_CONTROL, MSG_CURSOR
 
 # 日志目录
 LOG_DIR = os.path.join(os.path.expanduser('~'), 'MyDesk_Logs')
 os.makedirs(LOG_DIR, exist_ok=True)
 
+# 无订阅者时的日志节流间隔(秒)
+IDLE_LOG_INTERVAL = 60.0
+# 光标位置推送间隔(秒)
+CURSOR_INTERVAL = 0.04
+
+
 def _debug_log(msg):
-    """写入调试日志文件"""
+    """写入调试日志文件 (严禁在逐帧路径调用)"""
     try:
         log_file = os.path.join(LOG_DIR, 'controlled_debug.log')
         timestamp = datetime.datetime.now().strftime('%H:%M:%S.%f')[:-3]
@@ -34,14 +43,41 @@ def _debug_log(msg):
         pass
 
 
+class _CURSORINFO(ctypes.Structure):
+    _fields_ = [("cbSize", ctypes.c_ulong),
+                ("flags", ctypes.c_ulong),
+                ("hCursor", ctypes.c_void_p),
+                ("ptScreenPos", ctypes.c_long * 2)]
+
+
+_CURSOR_SHOWING = 0x00000001
+
+
+def get_cursor_state():
+    """返回 (虚拟桌面x, 虚拟桌面y, 是否可见); 失败返回 None。
+
+    mss 在 Windows 上不抓光标, 所以光标位置必须单独采集并推给主控端绘制。
+    """
+    try:
+        ci = _CURSORINFO()
+        ci.cbSize = ctypes.sizeof(_CURSORINFO)
+        if not ctypes.windll.user32.GetCursorInfo(ctypes.byref(ci)):
+            return None
+        return int(ci.ptScreenPos[0]), int(ci.ptScreenPos[1]), \
+            bool(ci.flags & _CURSOR_SHOWING)
+    except Exception:
+        return None
+
+
 class ScreenBroadcaster:
     """屏幕广播器 (每个被控端实例独立)
 
     用法:
       bc = ScreenBroadcaster(on_log)
-      bc.start()                      # 启动
+      bc.start()                        # 启动
       bc.subscribe(client_id, send_fn)  # 客户端订阅
-      bc.unsubscribe(client_id)       # 客户端断开
+      bc.unsubscribe(client_id)         # 客户端断开
+      bc.set_paused(client_id, True)    # 暂停向该客户端推送
     """
 
     def __init__(self, on_log=None):
@@ -50,71 +86,71 @@ class ScreenBroadcaster:
         self.fps = 30
         self.running = False
         self._sct = None
-        self._monitors = []  # 所有显示器列表
+        self._monitors = []  # 所有显示器列表 (主显示器在首位)
         self._threads = []  # 每个显示器的捕获线程
         self._cfg_lock = threading.Lock()
         # 订阅者: {client_id: send_fn}
         self._subscribers = {}
+        # 已暂停推送的客户端
+        self._paused = set()
         # 逐客户端发送锁: 用于"丢帧不排队", 防止慢客户端阻塞整个捕获循环
         self._sub_locks = {}
         self._sub_lock = threading.Lock()
-        # 屏幕信息
-        self._screen_info = []  # [(idx, w, h), ...]
+        # 屏幕信息: [(idx, w, h, left, top), ...]
+        self._screen_info = []
+        self._cursor_thread = None
 
     def start(self):
         if self.running:
-            _debug_log(f'[屏幕广播] start: 已在运行')
+            _debug_log('[屏幕广播] start: 已在运行')
             return True
         try:
-            _debug_log(f'[屏幕广播] start: 开始初始化 mss')
-            self._sct = mss.mss()
-            # 获取所有显示器
-            self._monitors = list(self._sct.monitors[1:])  # 跳过索引0 (全屏幕虚拟)
+            _debug_log('[屏幕广播] start: 开始初始化 mss')
+            self._sct = mss.MSS()
+            # 获取所有显示器 (跳过索引0的"全屏虚拟桌面")
+            self._monitors = list(self._sct.monitors[1:])
             _debug_log(f'[屏幕广播] 检测到 {len(self._monitors)} 个显示器')
-            
-            # 检测主显示器
+            if not self._monitors:
+                raise RuntimeError('未检测到任何显示器')
+
+            # 主显示器排到首位, 让 idx=0 与"主屏"语义一致
             primary_idx = 0
             for i, m in enumerate(self._monitors):
                 if m.get('is_primary'):
                     primary_idx = i
                     break
-            
-            # 调整顺序，主显示器放第一个
             if primary_idx > 0:
                 primary = self._monitors.pop(primary_idx)
                 self._monitors.insert(0, primary)
-            
-            # 保存屏幕信息
+
+            # 保存屏幕信息 (含虚拟桌面偏移, 供主控端做坐标换算)
             self._screen_info = [
-                (i, m['width'], m['height'])
+                (i, m['width'], m['height'], m.get('left', 0), m.get('top', 0))
                 for i, m in enumerate(self._monitors)
             ]
             _debug_log(f'[屏幕广播] 屏幕信息: {self._screen_info}')
-            
+
             self.running = True
-            _debug_log(f'[屏幕广播] running=True')
-            
+
             # 为每个显示器启动捕获线程
             for i, mon in enumerate(self._monitors):
-                t = threading.Thread(
-                    target=self._capture_loop,
-                    args=(i, mon),
-                    daemon=True
-                )
+                t = threading.Thread(target=self._capture_loop, args=(i, mon), daemon=True)
                 t.start()
                 self._threads.append(t)
-                _debug_log(f'[屏幕广播] 启动捕获线程: screen_idx={i}')
-            
-            # 发送屏幕信息给所有客户端
+
+            # 光标位置推送线程 (mss 不抓光标, 需单独发送)
+            self._cursor_thread = threading.Thread(target=self._cursor_loop, daemon=True)
+            self._cursor_thread.start()
+
             n_screens = len(self._monitors)
             self.on_log(f'[屏幕] 广播器启动, 检测到 {n_screens} 个显示器')
-            for idx, w, h in self._screen_info:
-                self.on_log(f'[屏幕]   屏幕{idx+1}: {w}x{h}')
-            
+            for idx, w, h, left, top in self._screen_info:
+                self.on_log(f'[屏幕]   屏幕{idx + 1}: {w}x{h} (虚拟偏移 {left},{top})')
             return True
         except Exception as e:
             _debug_log(f'[屏幕广播] start 异常: {e}')
             self.on_log(f'[屏幕] 启动失败: {e}')
+            self.running = False
             return False
 
     def stop(self):
@@ -122,14 +158,19 @@ class ScreenBroadcaster:
         for t in self._threads:
             t.join(timeout=1)
         self._threads = []
+        if self._cursor_thread:
+            self._cursor_thread.join(timeout=0.5)
+            self._cursor_thread = None
         if self._sct:
             try:
                 self._sct.close()
             except Exception:
                 pass
+            self._sct = None
         with self._sub_lock:
             self._subscribers.clear()
             self._sub_locks.clear()
+            self._paused.clear()
 
     # ---------- 订阅管理 ----------
     def subscribe(self, client_id, send_fn):
@@ -138,43 +179,53 @@ class ScreenBroadcaster:
         with self._sub_lock:
             self._subscribers[client_id] = send_fn
             self._sub_locks[client_id] = threading.Lock()
-        
-        n_screens = len(self._monitors)
-        _debug_log(f'[屏幕广播] 订阅者数量: {len(self._subscribers)}, 屏幕数量: {n_screens}')
-        
-        # 发送每个屏幕的尺寸信息 (格式: "SCREEN:{idx}:{w}x{h}")
-        for idx, w, h in self._screen_info:
+            self._paused.discard(client_id)
+
+        self._send_screen_info(send_fn)
+        self.on_log(f'[屏幕] +订阅 {client_id} (共 {self._sub_count()} 个)')
+
+    def resend_screen_info(self, client_id):
+        """按需重发显示器信息 (主控端窗口就绪后调用, 消除"信息早于窗口"的竞争)"""
+        with self._sub_lock:
+            send_fn = self._subscribers.get(client_id)
+        if send_fn is None:
+            return False
+        self._send_screen_info(send_fn)
+        return True
+
+    def _send_screen_info(self, send_fn):
+        """发送每个屏幕的尺寸+虚拟桌面偏移; 多屏时额外发送屏幕列表"""
+        for idx, w, h, left, top in self._screen_info:
             try:
-                info = f"SCREEN:{idx}:{w}x{h}".encode('utf-8')
-                _debug_log(f'[屏幕广播] 发送屏幕信息: {info.decode()}')
-                send_fn(MSG_CONTROL, info)
+                # "SCREEN:{idx}:{w}x{h}:{left}:{top}"
+                send_fn(MSG_CONTROL,
+                        f'SCREEN:{idx}:{w}x{h}:{left}:{top}'.encode('utf-8'))
             except Exception as e:
                 _debug_log(f'[屏幕广播] 发送屏幕信息失败: {e}')
-                pass
-        
-        # 如果有多个屏幕，发送多屏幕信息
-        if n_screens > 1:
+
+        if len(self._screen_info) > 1:
             try:
-                # 发送屏幕列表: "SCREEN_LIST:0:1920:1080,1:1920:1080"
-                screen_list_parts = []
-                for idx, w, h in self._screen_info:
-                    screen_list_parts.append(f'{idx}:{w}:{h}')
-                screen_list_msg = f"SCREEN_LIST:{','.join(screen_list_parts)}"
-                _debug_log(f'[屏幕广播] 发送屏幕列表: {screen_list_msg}')
-                send_fn(MSG_CONTROL, screen_list_msg.encode('utf-8'))
+                parts = [f'{idx}:{w}:{h}:{left}:{top}'
+                         for idx, w, h, left, top in self._screen_info]
+                send_fn(MSG_CONTROL, f"SCREEN_LIST:{','.join(parts)}".encode('utf-8'))
             except Exception as e:
                 _debug_log(f'[屏幕广播] 发送屏幕列表失败: {e}')
-                pass
-        
-        self.on_log(f'[屏幕] +订阅 {client_id} (共 {self._sub_count()} 个)')
-        _debug_log(f'[屏幕广播] subscribe 完成')
 
     def unsubscribe(self, client_id):
         with self._sub_lock:
-            if client_id in self._subscribers:
-                del self._subscribers[client_id]
+            self._subscribers.pop(client_id, None)
             self._sub_locks.pop(client_id, None)
+            self._paused.discard(client_id)
         self.on_log(f'[屏幕] -订阅 {client_id} (剩 {self._sub_count()} 个)')
+
+    def set_paused(self, client_id, paused):
+        """暂停/恢复向某个客户端推送画面 (该客户端仍保持订阅, 不影响其他人)"""
+        with self._sub_lock:
+            if paused:
+                self._paused.add(client_id)
+            else:
+                self._paused.discard(client_id)
+        _debug_log(f'[屏幕广播] set_paused {client_id} -> {paused}')
 
     def _sub_count(self):
         with self._sub_lock:
@@ -185,11 +236,9 @@ class ScreenBroadcaster:
             return list(self._subscribers.keys())
 
     def get_screen_count(self):
-        """获取显示器数量"""
         return len(self._monitors)
 
     def get_screen_info(self):
-        """获取所有屏幕信息"""
         return list(self._screen_info)
 
     # ---------- 捕获循环 (每个显示器独立) ----------
@@ -198,99 +247,128 @@ class ScreenBroadcaster:
         fail_count = 0
         w = monitor['width']
         h = monitor['height']
-        self.on_log(f'[屏幕] 屏幕{screen_idx+1} 捕获线程启动 ({w}x{h})')
-        _debug_log(f'[屏幕广播] _capture_loop 启动: screen_idx={screen_idx}, {w}x{h}')
-        
+        self.on_log(f'[屏幕] 屏幕{screen_idx + 1} 捕获线程启动 ({w}x{h})')
+
         # 每个线程创建自己的 mss 实例 (mss 不是线程安全的)
         try:
-            sct = mss.mss()
+            sct = mss.MSS()
         except Exception as e:
             _debug_log(f'[屏幕广播] 创建mss实例失败: {e}')
-            self.on_log(f'[屏幕] 屏幕{screen_idx+1} 创建mss实例失败: {e}')
+            self.on_log(f'[屏幕] 屏幕{screen_idx + 1} 创建mss实例失败: {e}')
             return
-        
+
         frame_count = 0
-        while self.running:
-            with self._sub_lock:
-                if not self._subscribers:
-                    time.sleep(0.1)
-                    if frame_count % 30 == 0:  # 每30帧输出一次
-                        _debug_log(f'[屏幕广播] 无订阅者, 等待中...')
+        last_idle_log = 0.0
+        try:
+            while self.running:
+                with self._sub_lock:
+                    active = len(self._subscribers)
+                    paused_all = active > 0 and len(self._paused) >= active
+                    idle = active == 0
+                if idle or paused_all:
+                    # 无人订阅 / 所有人都暂停: 不抓屏不编码, 节省 CPU
+                    if idle and time.time() - last_idle_log >= IDLE_LOG_INTERVAL:
+                        last_idle_log = time.time()
+                        _debug_log(f'[屏幕广播] 屏幕{screen_idx + 1} 无订阅者, 待机中')
+                    time.sleep(0.05)
                     continue
 
-            t0 = time.time()
-            try:
-                raw = sct.grab(monitor)
-                img = Image.frombytes('RGB', raw.size, raw.bgra, 'raw', 'BGRX')
-                buf = io.BytesIO()
-                with self._cfg_lock:
-                    q = self.quality
-                img.save(buf, format='JPEG', quality=q)
-                jpeg = buf.getvalue()
-                
-                # 构造帧数据: [屏幕索引 4字节][JPEG数据]
-                frame_data = struct.pack('<I', screen_idx) + jpeg
+                t0 = time.time()
+                try:
+                    raw = sct.grab(monitor)
+                    img = Image.frombytes('RGB', raw.size, raw.bgra, 'raw', 'BGRX')
+                    buf = io.BytesIO()
+                    with self._cfg_lock:
+                        q = self.quality
+                    img.save(buf, format='JPEG', quality=q)
+                    jpeg = buf.getvalue()
 
-                # 广播给所有订阅者
-                with self._sub_lock:
-                    subs = [(cid, fn, self._sub_locks.get(cid))
-                            for cid, fn in self._subscribers.items()]
-                
-                if frame_count < 3:  # 只记录前3帧
-                    _debug_log(f'[屏幕广播] 捕获帧 #{frame_count}: jpeg_size={len(jpeg)}, subscribers={len(subs)}')
-                
-                dead = []
-                for cid, send_fn, lk in subs:
-                    # 非阻塞获取该客户端的帧锁: 若上一帧尚未发送完成(客户端慢/卡),
-                    # 直接丢弃本帧, 绝不排队等待 —— 否则一个慢客户端会拖垮所有客户端。
-                    if lk is not None and not lk.acquire(blocking=False):
-                        continue
-                    try:
-                        send_fn(MSG_SCREEN, frame_data)
-                    except Exception as e:
-                        _debug_log(f'[屏幕广播] 发送帧失败: client={cid}, error={e}')
-                        dead.append(cid)
-                    finally:
-                        if lk is not None:
-                            lk.release()
-                # 清理断开的订阅者
-                if dead:
+                    # 构造帧数据: [屏幕索引 4字节][JPEG数据]
+                    frame_data = struct.pack('<I', screen_idx) + jpeg
+
+                    # 广播给所有订阅者
                     with self._sub_lock:
-                        for cid in dead:
-                            self._subscribers.pop(cid, None)
-                            self._sub_locks.pop(cid, None)
-                fail_count = 0
-                frame_count += 1
-            except (BrokenPipeError, ConnectionError, OSError) as e:
-                fail_count += 1
-                _debug_log(f'[屏幕广播] 捕获错误: {e}, fail_count={fail_count}')
-                if fail_count > 5:
-                    self.on_log(f'[屏幕] 屏幕{screen_idx+1} 捕获连续失败, 停止')
-                    break
-            except Exception as e:
-                _debug_log(f'[屏幕广播] 捕获异常: {e}')
-                self.on_log(f'[屏幕] 屏幕{screen_idx+1} 捕获异常: {e}')
-                fail_count += 1
-                if fail_count > 10:
-                    break
+                        subs = [(cid, fn, self._sub_locks.get(cid), cid in self._paused)
+                                for cid, fn in self._subscribers.items()]
 
-            # 帧率控制
-            with self._cfg_lock:
-                target_fps = self.fps
-            elapsed = time.time() - t0
-            interval = 1.0 / target_fps - elapsed
-            if interval > 0:
-                time.sleep(interval)
-        
-        # 关闭线程自己的 mss 实例
-        try:
-            sct.close()
-        except Exception:
-            pass
+                    dead = []
+                    for cid, send_fn, lk, paused in subs:
+                        if paused:
+                            continue
+                        # 非阻塞获取该客户端的帧锁: 若上一帧尚未发送完成(客户端慢/卡),
+                        # 直接丢弃本帧, 绝不排队等待 —— 否则一个慢客户端会拖垮所有客户端。
+                        if lk is not None and not lk.acquire(blocking=False):
+                            continue
+                        try:
+                            send_fn(MSG_SCREEN, frame_data)
+                        except Exception as e:
+                            _debug_log(f'[屏幕广播] 发送帧失败: client={cid}, error={e}')
+                            dead.append(cid)
+                        finally:
+                            if lk is not None:
+                                lk.release()
+                    if dead:
+                        with self._sub_lock:
+                            for cid in dead:
+                                self._subscribers.pop(cid, None)
+                                self._sub_locks.pop(cid, None)
+                                self._paused.discard(cid)
+                    fail_count = 0
+                    frame_count += 1
+                except (BrokenPipeError, ConnectionError, OSError) as e:
+                    fail_count += 1
+                    _debug_log(f'[屏幕广播] 捕获错误: {e}, fail_count={fail_count}')
+                    if fail_count > 5:
+                        self.on_log(f'[屏幕] 屏幕{screen_idx + 1} 捕获连续失败, 停止')
+                        break
+                except Exception as e:
+                    _debug_log(f'[屏幕广播] 捕获异常: {e}')
+                    self.on_log(f'[屏幕] 屏幕{screen_idx + 1} 捕获异常: {e}')
+                    fail_count += 1
+                    if fail_count > 10:
+                        break
 
-    def _is_paused_all(self):
-        """所有订阅者都暂停时才暂停"""
-        return False  # 简化: 不支持单客户端暂停
+                # 帧率控制
+                with self._cfg_lock:
+                    target_fps = max(1, self.fps)
+                elapsed = time.time() - t0
+                interval = 1.0 / target_fps - elapsed
+                if interval > 0:
+                    time.sleep(interval)
+        finally:
+            try:
+                sct.close()
+            except Exception:
+                pass
+            _debug_log(f'[屏幕广播] 屏幕{screen_idx + 1} 捕获线程退出')
+
+    # ---------- 光标位置 ----------
+    def _cursor_loop(self):
+        """轮询本机光标位置并推送给所有订阅者 (mss 抓不到光标, 必须单独发)"""
+        last = None
+        while self.running:
+            with self._sub_lock:
+                fns = [] if not self._subscribers else \
+                    [(cid, fn) for cid, fn in self._subscribers.items()
+                     if cid not in self._paused]
+            if not fns:
+                time.sleep(0.2)
+                continue
+            state = get_cursor_state()
+            if state is None:
+                time.sleep(0.2)
+                continue
+            if state != last:
+                last = state
+                x, y, visible = state
+                payload = struct.pack('<IIB', x & 0xFFFFFFFF, y & 0xFFFFFFFF,
+                                      1 if visible else 0)
+                for cid, fn in fns:
+                    try:
+                        fn(MSG_CURSOR, payload)
+                    except Exception:
+                        pass
+            time.sleep(CURSOR_INTERVAL)
 
     # ---------- 配置 ----------
     def set_quality(self, q):
