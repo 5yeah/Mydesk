@@ -139,7 +139,7 @@ class SafeApplication(QApplication):
 
 # 最早阶段日志 (跟踪启动流程, 便于崩溃定位)
 try:
-    crash_log('main.py 开始导入模块')
+    debug_log('main.py 开始导入模块', 'startup')
 except Exception:
     pass
 
@@ -196,7 +196,7 @@ class _AppBridge(QObject):
 class MyDeskApplication:
     def __init__(self):
         try:
-            crash_log('MyDeskApplication.__init__ 开始')
+            debug_log('MyDeskApplication.__init__ 开始', 'startup')
             # 高 DPI 缩放: 让 Qt 把本进程设为 Per-Monitor DPI 感知。
             # 这样远程鼠标坐标基于物理像素, 与 mss 捕获的物理分辨率一致,
             # 避免高 DPI(缩放)系统下远程鼠标错位/点不中("无法操作")。
@@ -250,7 +250,7 @@ class MyDeskApplication:
             self._error_timer.start()
 
             debug_log('[MyDesk] 应用初始化完成')
-            crash_log('MyDeskApplication.__init__ 完成')
+            debug_log('MyDeskApplication.__init__ 完成', 'startup')
         except Exception as e:
             crash_log(f'MyDeskApplication.__init__ CRASH: {e}\n{traceback.format_exc()}')
             raise
@@ -649,7 +649,7 @@ def run_silent():
 
 def main():
     try:
-        crash_log('main() 开始运行')
+        debug_log('main() 开始运行', 'startup')
 
         args = sys.argv[1:]
         silent = '--silent' in args
@@ -660,11 +660,11 @@ def main():
             return 0
 
         if silent:
-            crash_log('以静默模式启动被控端')
+            debug_log('以静默模式启动被控端', 'startup')
             return run_silent()
 
         app = MyDeskApplication()
-        crash_log('MyDeskApplication 创建完成, 调用 run()')
+        debug_log('MyDeskApplication 创建完成, 调用 run()', 'startup')
         app.run()
     except Exception as e:
         crash_log(f'CRASH: {e}\n{traceback.format_exc()}')

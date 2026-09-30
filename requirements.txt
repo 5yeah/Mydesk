@@ -1,4 +1,8 @@
+# MyDesk 运行依赖 (按实际 import 整理)
+#
+# 说明: 旧版 requirements.txt 列了 dxcam / pynput (代码里从未 import),
+# 却漏了 mss 和 pywin32 —— 照它安装会直接 `import mss` 失败起不来。
 PyQt5>=5.15
-dxcam>=0.0.5
+mss>=9.0
 Pillow>=9.0
-pynput>=1.7
+pywin32>=300

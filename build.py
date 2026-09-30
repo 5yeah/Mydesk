@@ -22,9 +22,8 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 # 使用 python -m PyInstaller 方式调用，确保在conda环境下也能找到
 PYI = [sys.executable, '-m', 'PyInstaller']
 
-HIDDEN = ['mss', 'PIL', 'pynput', 'pynput.mouse._win32', 'pynput.keyboard._win32',
-          'pywin32', 'win32com', 'win32com.shell', 'win32com.shell.shellcon',
-          'pythoncom']
+HIDDEN = ['mss', 'PIL', 'pywin32', 'win32com', 'win32com.shell',
+          'win32com.shell.shellcon', 'pythoncom', 'win32crypt']
 
 # conda 环境下 _ctypes 依赖 ffi DLL
 _FFI_DIR = os.path.join(os.path.dirname(sys.executable), 'Library', 'bin')

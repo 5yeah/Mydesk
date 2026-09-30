@@ -154,6 +154,54 @@ def _create_app_icon():
     return QIcon(pm)
 
 
+def _add_firewall_rules(port):
+    """为被控端监听端口添加 Windows 防火墙入站放行规则。
+
+    没有这一步的后果: 首次监听时系统会弹一次"是否允许", 用户在静默自启/远程
+    会话里根本看不到这个提示, 入站被静默拦截 —— 表现为"对方连不上且没有任何报错"。
+    """
+    results = []
+    name_tcp = 'MyDesk (TCP)'
+    name_udp = 'MyDesk Discovery (UDP)'
+    try:
+        from config import get_discovery_port
+        disc = get_discovery_port()
+    except Exception:
+        disc = port + 1
+    rules = [
+        (name_tcp, 'TCP', port),
+        (name_udp, 'UDP', disc),
+    ]
+    for name, proto, p in rules:
+        try:
+            # 先删旧规则, 避免重复添加(端口变了也能更新)
+            subprocess.run(
+                ['netsh', 'advfirewall', 'firewall', 'delete', 'rule',
+                 f'name={name}'],
+                capture_output=True, text=True)
+            r = subprocess.run(
+                ['netsh', 'advfirewall', 'firewall', 'add', 'rule',
+                 f'name={name}', 'dir=in', 'action=allow', f'protocol={proto}',
+                 f'localport={p}', 'profile=any'],
+                capture_output=True, text=True)
+            results.append((name, r.returncode == 0,
+                            (r.stderr or r.stdout or '').strip()))
+        except Exception as e:
+            results.append((name, False, str(e)))
+    return results
+
+
+def _remove_firewall_rules():
+    for name in ('MyDesk (TCP)', 'MyDesk Discovery (UDP)'):
+        try:
+            subprocess.run(
+                ['netsh', 'advfirewall', 'firewall', 'delete', 'rule',
+                 f'name={name}'],
+                capture_output=True, text=True)
+        except Exception:
+            pass
+
+
 # ============ 安装工作线程 ============
 class InstallWorker(QThread):
     progress = pyqtSignal(int, str)   # 进度百分比, 当前操作描述
@@ -203,7 +251,7 @@ class InstallWorker(QThread):
                 except Exception as e:
                     print(f'开始菜单失败: {e}')
 
-            # 4. 开机自启
+            # 4. 开机自启 (带上 --silent, main.py 现在真的支持静默模式)
             if self.autostart:
                 self.progress.emit(88, '正在配置开机自启...')
                 try:
@@ -216,8 +264,21 @@ class InstallWorker(QThread):
                 except Exception as e:
                     print(f'开机自启失败: {e}')
 
-            # 5. 注册卸载信息
-            self.progress.emit(92, '正在注册卸载信息...')
+            # 5. 放行防火墙入站端口 (否则对方连不上且无任何提示)
+            self.progress.emit(90, '正在配置防火墙...')
+            try:
+                from config import get_port
+                fw = _add_firewall_rules(get_port())
+                for name, okk, detail in fw:
+                    if not okk:
+                        print(f'防火墙规则 {name} 添加失败: {detail}')
+                    else:
+                        print(f'防火墙规则 {name} 已添加')
+            except Exception as e:
+                print(f'防火墙配置失败(需要管理员权限): {e}')
+
+            # 6. 注册卸载信息
+            self.progress.emit(94, '正在注册卸载信息...')
             try:
                 register_uninstall(self.install_dir, dst_exe)
             except Exception as e:
@@ -277,11 +338,15 @@ class UninstallWorker(QThread):
             except Exception:
                 pass
 
-            # 4. 移除卸载注册
+            # 4. 移除防火墙规则
+            self.progress.emit(75, '正在移除防火墙规则...')
+            _remove_firewall_rules()
+
+            # 5. 移除卸载注册
             self.progress.emit(80, '正在清理注册表...')
             unregister_uninstall()
 
-            # 5. 删除安装目录
+            # 6. 删除安装目录
             self.progress.emit(90, '正在删除程序文件...')
             if os.path.isdir(self.install_dir):
                 shutil.rmtree(self.install_dir, ignore_errors=True)

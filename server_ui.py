@@ -116,12 +116,12 @@ def main():
 
     menu = QMenu()
 
-    # 设备信息
+    # 设备信息 (不显示明文密码: 任何人走到电脑前点开托盘就能看到, 属于凭据泄漏)
     act_info = QAction(f'设备ID: {device_id}', menu)
     act_info.setEnabled(False)
     menu.addAction(act_info)
 
-    act_pwd = QAction(f'连接密码: {password}', menu)
+    act_pwd = QAction('连接密码: ●●●●●● (点「修改密码」查看/修改)', menu)
     act_pwd.setEnabled(False)
     menu.addAction(act_pwd)
 
@@ -171,8 +171,9 @@ def main():
         dlg = PasswordDialog()
         if dlg.exec_() == QDialog.Accepted and dlg.new_pwd:
             set_password(dlg.new_pwd)
-            QMessageBox.information(None, '成功', '密码已修改,新密码将在下次连接时生效')
-            act_pwd.setText(f'连接密码: {dlg.new_pwd}')
+            QMessageBox.information(
+                None, '成功',
+                '密码已修改。\n\n正在运行的被控端会自动加载新密码, 无需重启。')
 
     def on_autostart(checked):
         if checked:

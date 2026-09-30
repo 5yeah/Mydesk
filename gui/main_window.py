@@ -48,19 +48,19 @@ class MainWindow(QMainWindow):
 
     def __init__(self):
         try:
-            crash_log('MainWindow.__init__ 开始')
+            debug_log('MainWindow.__init__ 开始', 'startup')
             super().__init__()
-            crash_log('MainWindow: super().__init__ 完成')
+            debug_log('MainWindow: super().__init__ 完成', 'startup')
             self.setWindowTitle('MyDesk - 个人远程桌面')
             self.setMinimumSize(1100, 700)
             self.resize(1280, 800)
-            crash_log('MainWindow: 设置样式表')
+            debug_log('MainWindow: 设置样式表', 'startup')
             self.setStyleSheet(MAIN_STYLE)
 
             self._my_device_id = get_device_id()
-            crash_log('MainWindow: 加载密码')
+            debug_log('MainWindow: 加载密码', 'startup')
             self._my_password = get_password()
-            crash_log('MainWindow: 加载设备列表')
+            debug_log('MainWindow: 加载设备列表', 'startup')
             self._device_list = self._load_device_list()
             self._online_devices = set()
             self._port = get_port()
@@ -77,20 +77,20 @@ class MainWindow(QMainWindow):
             self._latency_timer = QTimer(self)
             self._latency_timer.timeout.connect(self._update_latency)
 
-            crash_log('MainWindow: 开始 _build_ui')
+            debug_log('MainWindow: 开始 _build_ui', 'startup')
             self._build_ui()
-            crash_log('MainWindow: _build_ui 完成')
+            debug_log('MainWindow: _build_ui 完成', 'startup')
 
             # 后台探测完成后在 GUI 线程刷新界面
             self.devices_refreshed.connect(self._on_devices_refreshed)
             self.diagnostics_ready.connect(self._on_diagnostics_ready)
 
-            crash_log('MainWindow: 开始 _start_discovery')
+            debug_log('MainWindow: 开始 _start_discovery', 'startup')
             self._start_discovery()
-            crash_log('MainWindow: _start_discovery 完成')
+            debug_log('MainWindow: _start_discovery 完成', 'startup')
 
             debug_log(f'[UI] 主窗口初始化完成, 设备ID: {self._my_device_id}', 'ui')
-            crash_log('MainWindow.__init__ 完成')
+            debug_log('MainWindow.__init__ 完成', 'startup')
         except Exception as e:
             import traceback
             crash_log(f'MainWindow.__init__ CRASH: {e}\n{traceback.format_exc()}')
@@ -161,17 +161,13 @@ class MainWindow(QMainWindow):
             debug_log(f'[UI] 保存设备列表失败: {e}', 'ui')
 
     def _build_ui(self):
-        crash_log('_build_ui: 开始')
         central = QWidget()
-        crash_log('_build_ui: QWidget 创建完成')
         self.setCentralWidget(central)
-        crash_log('_build_ui: setCentralWidget 完成')
 
         main_layout = QHBoxLayout(central)
         main_layout.setContentsMargins(0, 0, 0, 0)
         main_layout.setSpacing(0)
 
-        crash_log('_build_ui: 创建 Sidebar')
         sidebar = QFrame()
         sidebar.setObjectName('Sidebar')
         sidebar.setFixedWidth(200)
@@ -191,7 +187,6 @@ class MainWindow(QMainWindow):
 
         sidebar_layout.addSpacing(20)
 
-        crash_log('_build_ui: 创建导航按钮')
         self._nav_buttons = {}
         nav_items = [
             ('🏠', '远程控制', 'home'),
@@ -200,7 +195,6 @@ class MainWindow(QMainWindow):
         ]
 
         for icon, text, page_id in nav_items:
-            crash_log(f'_build_ui: 创建按钮 {page_id}')
             btn = SidebarButton(icon, text, page_id)
             btn.nav_clicked.connect(self._on_nav_clicked)
             self._nav_buttons[page_id] = btn
@@ -215,7 +209,6 @@ class MainWindow(QMainWindow):
 
         main_layout.addWidget(sidebar)
 
-        crash_log('_build_ui: 创建右侧内容区')
         content = QWidget()
         content_layout = QVBoxLayout(content)
         content_layout.setContentsMargins(0, 0, 0, 0)
@@ -233,7 +226,6 @@ class MainWindow(QMainWindow):
 
         topbar_layout.addStretch()
 
-        crash_log('_build_ui: 创建 StatusIndicator')
         self.status_indicator = StatusIndicator()
         self.status_indicator.set_color('#52c41a')
         topbar_layout.addWidget(self.status_indicator)
@@ -255,34 +247,41 @@ class MainWindow(QMainWindow):
 
         content_layout.addWidget(topbar)
 
-        crash_log('_build_ui: 构建页面堆栈')
         self._stack = QStackedWidget()
-        crash_log('_build_ui: 构建首页')
         self._stack.addWidget(self._build_home_page())
-        crash_log('_build_ui: 构建设备列表页')
         self._stack.addWidget(self._build_devices_page())
-        crash_log('_build_ui: 构建设置页')
         self._stack.addWidget(self._build_settings_page())
         content_layout.addWidget(self._stack)
 
         main_layout.addWidget(content, 1)
 
         self._nav_buttons['home'].setChecked(True)
-        crash_log('_build_ui: 完成')
 
     def _on_nav_clicked(self, page_id):
         page_map = {'home': 0, 'devices': 1, 'settings': 2}
         title_map = {'home': '远程控制', 'devices': '设备列表', 'settings': '高级设置'}
 
         for pid, btn in self._nav_buttons.items():
-            btn.setChecked(pid == page_id)
+            selected = (pid == page_id)
+            btn.setChecked(selected)
+            # theme.py 的 #SidebarButton[selected="true"] 依赖这个动态属性,
+            # 不设置的话选中态没有任何视觉反馈
+            btn.setProperty('selected', 'true' if selected else 'false')
+            try:
+                btn.style().unpolish(btn)
+                btn.style().polish(btn)
+            except Exception:
+                pass
 
         if page_id in page_map:
             self._stack.setCurrentIndex(page_map[page_id])
             self.lbl_page_title.setText(title_map[page_id])
+        if page_id == 'settings':
+            self._reload_settings_page()
+        elif page_id == 'devices':
+            self._refresh_devices_page()
 
     def _build_home_page(self):
-        crash_log('_build_home_page: 开始')
         outer = QWidget()
         outer_layout = QVBoxLayout(outer)
         outer_layout.setContentsMargins(0, 0, 0, 0)
@@ -298,9 +297,7 @@ class MainWindow(QMainWindow):
         layout.setContentsMargins(30, 20, 30, 20)
         layout.setSpacing(15)
 
-        crash_log('_build_home_page: 创建本机信息卡片')
         self_my_card = QFrame()
-        crash_log('_build_home_page: QFrame 创建完成')
         self_my_card.setObjectName('Card')
         card_layout = QVBoxLayout(self_my_card)
         card_layout.setSpacing(10)
@@ -310,46 +307,36 @@ class MainWindow(QMainWindow):
         title.setStyleSheet('font-size: 16px; font-weight: bold; color: #333;')
         card_layout.addWidget(title)
 
-        crash_log('_build_home_page: 创建设备ID行')
         id_row = QHBoxLayout()
         id_label = QLabel('设备代码:')
         id_label.setFixedWidth(70)
         id_label.setStyleSheet('color: #666; font-size: 13px;')
         id_row.addWidget(id_label)
 
-        crash_log('_build_home_page: 调用 _format_id')
         self.lbl_my_id = QLabel(self._format_id(self._my_device_id))
-        crash_log('_build_home_page: QLabel(id) 创建完成')
         self.lbl_my_id.setStyleSheet('font-size: 20px; font-weight: bold; color: #1677ff;')
-        crash_log('_build_home_page: QLabel(id) 样式设置完成')
         id_row.addWidget(self.lbl_my_id)
-        crash_log('_build_home_page: id_row.addWidget 完成')
 
         btn_copy_id = QPushButton('📋')
-        crash_log('_build_home_page: btn_copy_id 创建完成')
         btn_copy_id.setFixedSize(28, 28)
         btn_copy_id.setToolTip('复制设备ID')
         btn_copy_id.setStyleSheet('background: transparent; border: none; font-size: 14px;')
         btn_copy_id.setCursor(Qt.PointingHandCursor)
         btn_copy_id.clicked.connect(lambda: self._copy_to_clipboard(self._my_device_id))
         id_row.addWidget(btn_copy_id)
-        crash_log('_build_home_page: btn_copy_id 添加完成')
 
         id_row.addStretch()
         card_layout.addLayout(id_row)
-        crash_log('_build_home_page: id_row 添加到 card_layout')
 
         pwd_row = QHBoxLayout()
         pwd_label = QLabel('访问密码:')
         pwd_label.setFixedWidth(70)
         pwd_label.setStyleSheet('color: #666; font-size: 13px;')
         pwd_row.addWidget(pwd_label)
-        crash_log('_build_home_page: 密码行创建')
 
         self.lbl_my_password = QLabel(self._my_password)
         self.lbl_my_password.setStyleSheet('font-size: 16px; font-weight: bold; color: #ff6b00;')
         pwd_row.addWidget(self.lbl_my_password)
-        crash_log('_build_home_page: 密码Label创建')
 
         btn_copy_pwd = QPushButton('📋')
         btn_copy_pwd.setFixedSize(28, 28)
@@ -358,7 +345,6 @@ class MainWindow(QMainWindow):
         btn_copy_pwd.setCursor(Qt.PointingHandCursor)
         btn_copy_pwd.clicked.connect(lambda: self._copy_to_clipboard(self._my_password))
         pwd_row.addWidget(btn_copy_pwd)
-        crash_log('_build_home_page: 复制密码按钮创建')
 
         btn_refresh_pwd = QPushButton('刷新')
         btn_refresh_pwd.setStyleSheet('background: transparent; border: 1px solid #e8e8e8; border-radius: 4px; padding: 2px 10px; color: #666; font-size: 12px;')
@@ -371,24 +357,19 @@ class MainWindow(QMainWindow):
         btn_edit_pwd.setCursor(Qt.PointingHandCursor)
         btn_edit_pwd.clicked.connect(self._edit_password)
         pwd_row.addWidget(btn_edit_pwd)
-        crash_log('_build_home_page: 刷新密码按钮创建')
 
         pwd_row.addStretch()
         card_layout.addLayout(pwd_row)
-        crash_log('_build_home_page: 密码行添加完成')
 
         ip_row = QHBoxLayout()
         ip_label = QLabel('IP 地址:')
         ip_label.setFixedWidth(70)
         ip_label.setStyleSheet('color: #666; font-size: 13px;')
         ip_row.addWidget(ip_label)
-        crash_log('_build_home_page: IP行创建, 准备获取IP')
 
         self.lbl_my_ip = QLabel(self._get_local_ip())
-        crash_log('_build_home_page: IP获取完成')
         self.lbl_my_ip.setStyleSheet('font-size: 13px; color: #333;')
         ip_row.addWidget(self.lbl_my_ip)
-        crash_log('_build_home_page: IP Label添加完成')
 
         btn_copy_ip = QPushButton('📋')
         btn_copy_ip.setFixedSize(28, 28)
@@ -397,11 +378,9 @@ class MainWindow(QMainWindow):
         btn_copy_ip.setCursor(Qt.PointingHandCursor)
         btn_copy_ip.clicked.connect(lambda: self._copy_to_clipboard(self.lbl_my_ip.text()))
         ip_row.addWidget(btn_copy_ip)
-        crash_log('_build_home_page: btn_copy_ip 创建完成')
 
         ip_row.addStretch()
         card_layout.addLayout(ip_row)
-        crash_log('_build_home_page: ip_row 添加完成')
 
         # 安全提示: 必须与事实一致。
         # 现状: 认证已改为挑战-响应(每次连接 nonce 不同, 抓到包也无法重放),
@@ -424,23 +403,18 @@ class MainWindow(QMainWindow):
                 'background-color: #fafafa; border-radius: 6px;')
         security_tip.setWordWrap(True)
         card_layout.addWidget(security_tip)
-        crash_log('_build_home_page: security_tip 创建完成')
 
         layout.addWidget(self_my_card)
-        crash_log('_build_home_page: self_my_card 添加到 layout')
 
-        crash_log('_build_home_page: 创建连接卡片')
         connect_card = QFrame()
         connect_card.setObjectName('Card')
         card_layout2 = QVBoxLayout(connect_card)
         card_layout2.setSpacing(10)
         card_layout2.setContentsMargins(20, 15, 20, 15)
-        crash_log('_build_home_page: connect_card 创建完成')
 
         title2 = QLabel('🔗 连接远程设备')
         title2.setStyleSheet('font-size: 16px; font-weight: bold; color: #333;')
         card_layout2.addWidget(title2)
-        crash_log('_build_home_page: title2 创建完成')
 
         # ===== 历史连接 (吸收自 unified_ui) =====
         hist_label = QLabel('🕘 历史连接:')
@@ -474,7 +448,6 @@ class MainWindow(QMainWindow):
         card_layout2.addLayout(hist_row)
         self._refresh_history()
 
-        crash_log('_build_home_page: 开始 mode_switch_row')
         mode_switch_row = QHBoxLayout()
         mode_switch_row.setSpacing(6)
         self.btn_mode_id = QPushButton('设备ID')
@@ -484,7 +457,6 @@ class MainWindow(QMainWindow):
         self.btn_mode_id.setStyleSheet('background-color: #1677ff; color: white; border: none; border-radius: 6px; font-size: 13px;')
         self.btn_mode_id.clicked.connect(lambda: self._set_conn_mode('id'))
         mode_switch_row.addWidget(self.btn_mode_id)
-        crash_log('_build_home_page: btn_mode_id 创建完成')
 
         self.btn_mode_ip = QPushButton('IP地址')
         self.btn_mode_ip.setCheckable(True)
@@ -494,9 +466,7 @@ class MainWindow(QMainWindow):
         mode_switch_row.addWidget(self.btn_mode_ip)
         mode_switch_row.addStretch()
         card_layout2.addLayout(mode_switch_row)
-        crash_log('_build_home_page: mode_switch_row 完成')
 
-        crash_log('_build_home_page: 开始 id_input_row')
         id_input_row = QHBoxLayout()
         self.id_input_label = QLabel('设备代码:')
         self.id_input_label.setFixedWidth(70)
@@ -509,9 +479,7 @@ class MainWindow(QMainWindow):
         self.input_device_id.setStyleSheet('font-size: 14px;')
         id_input_row.addWidget(self.input_device_id, 1)
         card_layout2.addLayout(id_input_row)
-        crash_log('_build_home_page: id_input_row 完成')
 
-        crash_log('_build_home_page: 开始 pwd_input_row')
         pwd_input_row = QHBoxLayout()
         pwd_input_label = QLabel('访问密码:')
         pwd_input_label.setFixedWidth(70)
@@ -524,9 +492,7 @@ class MainWindow(QMainWindow):
         self.input_password.setEchoMode(QLineEdit.Password)
         pwd_input_row.addWidget(self.input_password, 1)
         card_layout2.addLayout(pwd_input_row)
-        crash_log('_build_home_page: pwd_input_row 完成')
 
-        crash_log('_build_home_page: 开始 mode_row')
         mode_row = QHBoxLayout()
         mode_row.setSpacing(8)
         mode_label = QLabel('连接模式:')
@@ -541,7 +507,6 @@ class MainWindow(QMainWindow):
         self.mode_control.setStyleSheet('background-color: #1677ff; color: white; border: none; border-radius: 6px; padding: 0 18px; font-size: 13px;')
         self.mode_control.clicked.connect(lambda: self._set_mode('control'))
         mode_row.addWidget(self.mode_control)
-        crash_log('_build_home_page: mode_control 完成')
 
         self.mode_file = QPushButton('文件传输')
         self.mode_file.setCheckable(True)
@@ -549,7 +514,6 @@ class MainWindow(QMainWindow):
         self.mode_file.setStyleSheet('background-color: white; color: #666; border: 1px solid #d9d9d9; border-radius: 6px; padding: 0 18px; font-size: 13px;')
         self.mode_file.clicked.connect(lambda: self._set_mode('file'))
         mode_row.addWidget(self.mode_file)
-        crash_log('_build_home_page: mode_file 完成')
 
         self.mode_view = QPushButton('仅观看')
         self.mode_view.setCheckable(True)
@@ -557,13 +521,10 @@ class MainWindow(QMainWindow):
         self.mode_view.setStyleSheet('background-color: white; color: #666; border: 1px solid #d9d9d9; border-radius: 6px; padding: 0 18px; font-size: 13px;')
         self.mode_view.clicked.connect(lambda: self._set_mode('view'))
         mode_row.addWidget(self.mode_view)
-        crash_log('_build_home_page: mode_view 完成')
 
         mode_row.addStretch()
         card_layout2.addLayout(mode_row)
-        crash_log('_build_home_page: mode_row 完成')
 
-        crash_log('_build_home_page: 开始 btn_connect')
         self.btn_connect = QPushButton('连接')
         self.btn_connect.setObjectName('PrimaryBtn')
         self.btn_connect.setFixedHeight(42)
@@ -571,13 +532,11 @@ class MainWindow(QMainWindow):
         self.btn_connect.setCursor(Qt.PointingHandCursor)
         self.btn_connect.clicked.connect(self._on_connect_clicked)
         card_layout2.addWidget(self.btn_connect)
-        crash_log('_build_home_page: btn_connect 完成')
 
         self.lbl_connect_status = QLabel('')
         self.lbl_connect_status.setStyleSheet('color: #666; font-size: 12px;')
         self.lbl_connect_status.setAlignment(Qt.AlignCenter)
         card_layout2.addWidget(self.lbl_connect_status)
-        crash_log('_build_home_page: lbl_connect_status 完成')
 
         # ===== 网络诊断 (吸收自 unified_ui) =====
         self.btn_diag = QPushButton('🔧 网络诊断')
@@ -587,7 +546,6 @@ class MainWindow(QMainWindow):
         card_layout2.addWidget(self.btn_diag)
 
         layout.addWidget(connect_card)
-        crash_log('_build_home_page: connect_card 添加到 layout')
 
         # 最近连接: 卡片常驻, 内容放进 self.recent_layout 以便局部刷新。
         # (旧版是"有设备才建卡片、删设备就整页重建", 结果每次删设备都会把
@@ -624,13 +582,10 @@ class MainWindow(QMainWindow):
         self._refresh_recent_devices()
 
         layout.addStretch()
-        crash_log('_build_home_page: layout.addStretch 完成')
 
         main_scroll.setWidget(page)
         outer_layout.addWidget(main_scroll)
-        crash_log('_build_home_page: scroll.setWidget 完成')
 
-        crash_log('_build_home_page: 返回 outer')
         return outer
 
     def _create_recent_device_item(self, device):

@@ -28,7 +28,7 @@ from protocol import (
     CTL_SCREEN_INFO_REQ,
 )
 from config import (get_device_id, get_password, get_port, get_discovery_port,
-                    CONFIG_FILE, load_config)
+                    CONFIG_FILE, load_config, load_settings)
 from screen_broadcaster import ScreenBroadcaster
 from input_control import handle_input
 from file_transfer import FileTransfer
@@ -146,6 +146,15 @@ class Controlled:
                     break
                 _debug_log(f'[被控端] accept 瞬时异常(忽略并继续监听): {e}')
                 time.sleep(0.05)
+                continue
+            # 访问控制: 仅局域网 / IP 白名单 (高级设置里真的会生效)
+            if not self._peer_allowed(addr[0]):
+                self.on_log(f'[被控端] 拒绝 {addr[0]} (不满足局域网/白名单设置)')
+                _debug_log(f'[被控端] 拒绝连接: {addr[0]} 未通过访问控制')
+                try:
+                    conn.close()
+                except Exception:
+                    pass
                 continue
             # 连接数限制: 未认证的连接也占用名额, 防止连接耗尽
             with self._lock:
@@ -318,6 +327,52 @@ class Controlled:
         with self._lock:
             rec = self._auth_failures.get(ip)
             return rec[0] if rec else 0
+
+    @staticmethod
+    def _is_private_ip(ip):
+        """私有/本机/Tailscale(CGNAT) 地址判断, 用于"仅局域网"模式"""
+        try:
+            parts = [int(p) for p in ip.split('.')]
+        except Exception:
+            return False
+        if len(parts) != 4 or any(p < 0 or p > 255 for p in parts):
+            return False
+        a, b = parts[0], parts[1]
+        if a == 127:                       # 本机回环
+            return True
+        if a == 10:                        # 10.0.0.0/8
+            return True
+        if a == 192 and b == 168:          # 192.168.0.0/16
+            return True
+        if a == 172 and 16 <= b <= 31:     # 172.16.0.0/12
+            return True
+        if a == 169 and b == 254:          # 169.254.0.0/16 (链路本地)
+            return True
+        if a == 100 and 64 <= b <= 127:    # 100.64.0.0/10 (Tailscale/CGNAT)
+            return True
+        return False
+
+    def _peer_allowed(self, ip):
+        """按高级设置里的"仅局域网"和"IP 白名单"决定是否接受该来源。
+
+        本机回环永远放行, 否则本机自测会被自己挡住。
+        """
+        if ip in ('127.0.0.1', '::1'):
+            return True
+        try:
+            st = load_settings()
+        except Exception:
+            return True
+        # 白名单优先: 开启且填了内容时, 只允许匹配前缀/全等的地址
+        if st.get('ip_whitelist'):
+            patterns = [p.strip() for p in str(st.get('whitelist_ips', '')).split(',')
+                        if p.strip()]
+            if patterns:
+                if not any(ip == p or ip.startswith(p) for p in patterns):
+                    return False
+        if st.get('lan_only') and not self._is_private_ip(ip):
+            return False
+        return True
 
     # ---------- 客户端处理 ----------
     def _handle_client(self, conn, addr):
