@@ -1,0 +1,24 @@
+# ===== 构建产物 (体积大, 可重建) =====
+build/
+dist/
+*.spec
+__pycache__/
+*.pyc
+*.pyo
+
+# ===== 运行日志 =====
+*.log
+_launch.log
+
+# ===== 本次审查/修复的临时探针与权限修复备份 =====
+.acl-recovery/
+
+# ===== 本地环境 =====
+.venv/
+venv/
+env/
+.idea/
+.vscode/
+*.swp
+Thumbs.db
+desktop.ini

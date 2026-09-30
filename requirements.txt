@@ -1,0 +1,4 @@
+PyQt5>=5.15
+dxcam>=0.0.5
+Pillow>=9.0
+pynput>=1.7
