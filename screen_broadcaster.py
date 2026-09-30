@@ -99,6 +99,9 @@ class ScreenBroadcaster:
         # 屏幕信息: [(idx, w, h, left, top), ...]
         self._screen_info = []
         self._cursor_thread = None
+        # 新客户端订阅后需要"强制再发一次"光标位置: 光标线程只在位置变化时才推,
+        # 若用户没动鼠标, 后连接的客户端会一直看不到远端光标。
+        self._cursor_dirty = True
 
     def start(self):
         if self.running:
@@ -180,6 +183,8 @@ class ScreenBroadcaster:
             self._subscribers[client_id] = send_fn
             self._sub_locks[client_id] = threading.Lock()
             self._paused.discard(client_id)
+            # 强制光标线程立刻给这个新客户端推一次当前位置
+            self._cursor_dirty = True
 
         self._send_screen_info(send_fn)
         self.on_log(f'[屏幕] +订阅 {client_id} (共 {self._sub_count()} 个)')
@@ -344,13 +349,14 @@ class ScreenBroadcaster:
 
     # ---------- 光标位置 ----------
     def _cursor_loop(self):
-        """轮询本机光标位置并推送给所有订阅者 (mss 抓不到光标, 必须单独发)"""
+        """轮询本机光标位置并推送给所有订阅者 (mss 不抓光标, 必须单独发)"""
         last = None
         while self.running:
             with self._sub_lock:
                 fns = [] if not self._subscribers else \
                     [(cid, fn) for cid, fn in self._subscribers.items()
                      if cid not in self._paused]
+                dirty = self._cursor_dirty
             if not fns:
                 time.sleep(0.2)
                 continue
@@ -358,8 +364,12 @@ class ScreenBroadcaster:
             if state is None:
                 time.sleep(0.2)
                 continue
-            if state != last:
+            # dirty: 有新客户端刚订阅 -> 即使光标没动也要推一次,
+            # 否则后连接的客户端在用户不动鼠标前看不到远端光标
+            if state != last or dirty:
                 last = state
+                with self._sub_lock:
+                    self._cursor_dirty = False
                 x, y, visible = state
                 payload = struct.pack('<IIB', x & 0xFFFFFFFF, y & 0xFFFFFFFF,
                                       1 if visible else 0)
