@@ -7,27 +7,26 @@
 """
 
 import os
-import json
-import time
-import struct
 import socket
+import secrets
 import threading
-import random
 from datetime import datetime
 
 from config import (
-    get_password, set_password, get_device_id, get_port,
+    get_password, set_password, get_device_id, get_port, get_discovery_port,
     get_history, add_history, remove_history, clear_history,
+    load_settings, save_settings, read_json, atomic_write_json,
+    DEVICE_LIST_FILE,
 )
 
-from PyQt5.QtCore import Qt, QTimer, pyqtSignal, QSize
+from PyQt5.QtCore import Qt, QTimer, pyqtSignal, QSize, QObject
 from PyQt5.QtGui import QIcon, QPixmap, QColor, QFont, QPainter, QLinearGradient, QRadialGradient
 from PyQt5.QtWidgets import (
     QApplication, QWidget, QMainWindow, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
     QLineEdit, QFrame, QListWidget, QListWidgetItem, QStackedWidget,
     QTableWidget, QTableWidgetItem, QHeaderView, QTabWidget, QCheckBox,
     QSpinBox, QComboBox, QSlider, QGroupBox, QFormLayout, QMenu, QAction,
-    QSystemTrayIcon, QMenu as QMenuBar, QToolTip, QScrollArea, QGridLayout,
+    QSystemTrayIcon, QToolTip, QScrollArea, QGridLayout,
     QSizePolicy, QGraphicsDropShadowEffect, QFileDialog, QMessageBox, QInputDialog,
 )
 
@@ -35,8 +34,8 @@ from .logger import LOG_DIR, crash_log, debug_log
 from .theme import MAIN_STYLE, THEME
 from .widgets import StatusIndicator, SidebarButton, ToggleSwitch
 
-# 数据目录
-DATA_DIR = os.path.join(os.path.expanduser('~'), 'MyDesk_Data')
+# 数据目录 (兼容旧路径)
+DATA_DIR = os.path.dirname(DEVICE_LIST_FILE)
 
 
 class MainWindow(QMainWindow):
@@ -44,9 +43,8 @@ class MainWindow(QMainWindow):
 
     # 信号
     connect_requested = pyqtSignal(str, str, str)  # 设备ID, 模式, 密码
-    file_transfer_requested = pyqtSignal(str)  # 设备ID
-    terminal_requested = pyqtSignal(str)  # 设备ID
-    device_list_changed = pyqtSignal()
+    devices_refreshed = pyqtSignal()               # 后台探测完成 -> GUI 线程刷新
+    diagnostics_ready = pyqtSignal(str)            # 网络诊断结果(文本)
 
     def __init__(self):
         try:
@@ -67,13 +65,25 @@ class MainWindow(QMainWindow):
             self._online_devices = set()
             self._port = get_port()
 
+            # 设备列表可能被后台连接线程与 GUI 线程同时读写 -> 统一加锁
+            self._device_lock = threading.RLock()
+            # 网络探测防重入: 上一轮没跑完就不再起新线程
+            self._scanning = False
+            # IP 地址只解析一次 (解析要走 socket, 不要每次重建页面都做)
+            self._local_ip = None
+
             self._latency = 0
+            self._rtt_source = None   # 由 MyDeskApplication 注入: () -> ms or None
             self._latency_timer = QTimer(self)
             self._latency_timer.timeout.connect(self._update_latency)
 
             crash_log('MainWindow: 开始 _build_ui')
             self._build_ui()
             crash_log('MainWindow: _build_ui 完成')
+
+            # 后台探测完成后在 GUI 线程刷新界面
+            self.devices_refreshed.connect(self._on_devices_refreshed)
+            self.diagnostics_ready.connect(self._on_diagnostics_ready)
 
             crash_log('MainWindow: 开始 _start_discovery')
             self._start_discovery()
@@ -86,27 +96,67 @@ class MainWindow(QMainWindow):
             crash_log(f'MainWindow.__init__ CRASH: {e}\n{traceback.format_exc()}')
             raise
 
+    # ============ 供 MyDeskApplication 调用的公共接口 ============
+    def set_rtt_source(self, fn):
+        """注入真实延迟来源: fn() -> 毫秒 或 None"""
+        self._rtt_source = fn
+
+    def set_connect_status(self, text, error=False):
+        """更新主页连接状态文字"""
+        try:
+            self.lbl_connect_status.setText(text)
+            self.lbl_connect_status.setStyleSheet(
+                'color: #ff4d4f; font-size: 12px;' if error
+                else 'color: #1677ff; font-size: 12px;')
+        except Exception:
+            pass
+
+    def reset_connect_button(self):
+        try:
+            self.btn_connect.setEnabled(True)
+            self.btn_connect.setText('🔌 连接')
+        except Exception:
+            pass
+
+    def update_device_ip(self, device_id, ip):
+        """更新设备记录里的地址 (可能由后台线程调用: 只操作数据 + 原子写文件)"""
+        with self._device_lock:
+            for device in self._device_list:
+                if device.get('id') == device_id:
+                    device['ip'] = ip
+                    device['online'] = True
+                    self._save_device_list()
+                    return
+
+    def add_history_entry(self, target, password, host=None):
+        """记录一条连接历史 (可能由后台线程调用)"""
+        try:
+            add_history(target, password, host)
+        except Exception as e:
+            debug_log(f'[UI] 写入历史记录失败: {e}', 'ui')
+
     def _generate_password(self):
-        chars = string.ascii_lowercase + string.digits
-        return ''.join(random.choices(chars, k=6))
+        """生成随机访问密码 (用 secrets 而非 random: 这是凭据, 必须是密码学安全随机)"""
+        alphabet = 'abcdefghijkmnopqrstuvwxyz23456789'   # 去掉易混淆的 l/1/0/o
+        return ''.join(secrets.choice(alphabet) for _ in range(9))
 
     def _load_device_list(self):
         try:
             os.makedirs(DATA_DIR, exist_ok=True)
-            file_path = os.path.join(DATA_DIR, 'device_list.json')
-            if os.path.exists(file_path):
-                with open(file_path, 'r', encoding='utf-8') as f:
-                    return json.load(f)
+            data = read_json(DEVICE_LIST_FILE)
+            if isinstance(data, list):
+                return data
         except Exception as e:
             debug_log(f'[UI] 加载设备列表失败: {e}', 'ui')
         return []
 
     def _save_device_list(self):
+        """原子写入设备列表 (由 self._device_lock 保护)"""
         try:
             os.makedirs(DATA_DIR, exist_ok=True)
-            file_path = os.path.join(DATA_DIR, 'device_list.json')
-            with open(file_path, 'w', encoding='utf-8') as f:
-                json.dump(self._device_list, f, ensure_ascii=False, indent=2)
+            with self._device_lock:
+                snapshot = list(self._device_list)
+            atomic_write_json(DEVICE_LIST_FILE, snapshot)
         except Exception as e:
             debug_log(f'[UI] 保存设备列表失败: {e}', 'ui')
 
@@ -353,8 +403,26 @@ class MainWindow(QMainWindow):
         card_layout.addLayout(ip_row)
         crash_log('_build_home_page: ip_row 添加完成')
 
-        security_tip = QLabel('🔒 端到端加密已启用，仅本人设备可连接')
-        security_tip.setStyleSheet('color: #52c41a; font-size: 12px; padding: 8px; background-color: #f6ffed; border-radius: 6px;')
+        # 安全提示: 必须与事实一致。
+        # 现状: 认证已改为挑战-响应(每次连接 nonce 不同, 抓到包也无法重放),
+        # 但画面/输入/文件数据仍是明文传输 —— 局域网内可被嗅探。
+        # 因此这里如实说明, 不再宣称"端到端加密已启用"。
+        pwd_weak = (self._my_password == '123456' or len(self._my_password) < 8)
+        if pwd_weak:
+            security_tip = QLabel(
+                '⚠️ 认证已启用防重放, 但数据未加密(局域网可被嗅探); '
+                '当前连接密码较弱, 建议点「编辑」改成 8 位以上')
+            security_tip.setStyleSheet(
+                'color: #d46b08; font-size: 12px; padding: 8px; '
+                'background-color: #fff7e6; border-radius: 6px;')
+        else:
+            security_tip = QLabel(
+                '🔑 认证已启用挑战-响应(防重放), 数据未加密; '
+                '请只在可信网络(局域网 / Tailscale)中使用')
+            security_tip.setStyleSheet(
+                'color: #8c8c8c; font-size: 12px; padding: 8px; '
+                'background-color: #fafafa; border-radius: 6px;')
+        security_tip.setWordWrap(True)
         card_layout.addWidget(security_tip)
         crash_log('_build_home_page: security_tip 创建完成')
 
@@ -521,40 +589,39 @@ class MainWindow(QMainWindow):
         layout.addWidget(connect_card)
         crash_log('_build_home_page: connect_card 添加到 layout')
 
-        crash_log(f'_build_home_page: 检查 device_list, len={len(self._device_list) if self._device_list else 0}')
-        if self._device_list:
-            recent_card = QFrame()
-            recent_card.setObjectName('Card')
-            recent_layout = QVBoxLayout(recent_card)
-            recent_layout.setSpacing(8)
-            recent_layout.setContentsMargins(20, 15, 20, 15)
+        # 最近连接: 卡片常驻, 内容放进 self.recent_layout 以便局部刷新。
+        # (旧版是"有设备才建卡片、删设备就整页重建", 结果每次删设备都会把
+        #  用户已经填好的设备ID/密码清空, 还要重跑一次阻塞式取IP。)
+        recent_card = QFrame()
+        recent_card.setObjectName('Card')
+        recent_card_layout = QVBoxLayout(recent_card)
+        recent_card_layout.setSpacing(8)
+        recent_card_layout.setContentsMargins(20, 15, 20, 15)
 
-            title3 = QLabel('🕐 最近连接')
-            title3.setStyleSheet('font-size: 14px; font-weight: bold; color: #333;')
-            recent_layout.addWidget(title3)
+        title3 = QLabel('🕐 最近连接')
+        title3.setStyleSheet('font-size: 14px; font-weight: bold; color: #333;')
+        recent_card_layout.addWidget(title3)
 
-            scroll = QScrollArea()
-            scroll.setWidgetResizable(True)
-            scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-            scroll.setMaximumHeight(200)
-            scroll.setStyleSheet('QScrollArea { border: none; }')
+        self.recent_scroll = QScrollArea()
+        self.recent_scroll.setWidgetResizable(True)
+        self.recent_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.recent_scroll.setMaximumHeight(200)
+        self.recent_scroll.setStyleSheet('QScrollArea { border: none; }')
 
-            scroll_content = QWidget()
-            scroll_layout = QVBoxLayout(scroll_content)
-            scroll_layout.setSpacing(6)
-            scroll_layout.setContentsMargins(0, 0, 0, 0)
+        recent_content = QWidget()
+        self.recent_layout = QVBoxLayout(recent_content)
+        self.recent_layout.setSpacing(6)
+        self.recent_layout.setContentsMargins(0, 0, 0, 0)
+        self.recent_scroll.setWidget(recent_content)
+        recent_card_layout.addWidget(self.recent_scroll)
 
-            for i, device in enumerate(self._device_list[:5]):
-                item = self._create_recent_device_item(device)
-                scroll_layout.addWidget(item)
-            crash_log('_build_home_page: recent items 创建完成')
+        self.recent_empty_label = QLabel('暂无记录，连接一次后会显示在这里')
+        self.recent_empty_label.setStyleSheet('color: #bbb; font-size: 12px;')
+        self.recent_layout.addWidget(self.recent_empty_label)
+        self.recent_layout.addStretch()
 
-            scroll_layout.addStretch()
-            scroll.setWidget(scroll_content)
-            recent_layout.addWidget(scroll)
-
-            layout.addWidget(recent_card)
-            crash_log('_build_home_page: recent_card 添加完成')
+        layout.addWidget(recent_card)
+        self._refresh_recent_devices()
 
         layout.addStretch()
         crash_log('_build_home_page: layout.addStretch 完成')
@@ -640,102 +707,145 @@ class MainWindow(QMainWindow):
         password = self.input_password.text().strip()
 
         if not device_id:
-            self.lbl_connect_status.setText('⚠️ 请输入设备ID或IP地址')
-            self.lbl_connect_status.setStyleSheet('color: #ff4d4f;')
+            self.set_connect_status('⚠️ 请输入设备ID或IP地址', error=True)
             return
 
         if not password:
-            self.lbl_connect_status.setText('⚠️ 请输入访问密码')
-            self.lbl_connect_status.setStyleSheet('color: #ff4d4f;')
+            self.set_connect_status('⚠️ 请输入访问密码', error=True)
             return
 
-        self.lbl_connect_status.setText('⏳ 正在连接...')
-        self.lbl_connect_status.setStyleSheet('color: #1677ff;')
+        self.set_connect_status('⏳ 正在连接...')
         self.btn_connect.setEnabled(False)
         self.btn_connect.setText('连接中...')
 
-        QTimer.singleShot(100, lambda: self._do_connect(device_id, password))
+        # 不做"3 秒后无条件复位"了: 那会让慢速连接(跨网/Tailscale)的按钮
+        # 在真正连上之前又变回可点, 重复点击会覆盖正在进行的 Controller。
+        # 现在由 _on_session_ready / _on_connect_failed 明确复位。
+        self._do_connect(device_id, password)
 
     def _do_connect(self, device_id, password):
-        is_ip = '.' in device_id and device_id.replace('.', '').replace(':', '').isdigit()
-        if is_ip:
-            ip_addr = device_id.split(':')[0] if ':' in device_id else device_id
-            self._add_to_device_list(device_id, ip=ip_addr)
-        else:
-            self._add_to_device_list(device_id)
-
-        self._refresh_devices_page()
-
         mode = getattr(self, '_current_mode', 'control')
         self.connect_requested.emit(device_id, mode, password)
-
-        QTimer.singleShot(3000, lambda: self._reset_connect_button())
 
     def _reset_connect_button(self):
         self.btn_connect.setEnabled(True)
         self.btn_connect.setText('🔌 连接')
-        self.lbl_connect_status.setText('')
 
     def _quick_connect(self, device):
         self.input_device_id.setText(device.get('id', ''))
-        self.input_password.setText(device.get('password', ''))
+        self.input_password.setText(self._device_password(device))
         self._on_connect_clicked()
 
+    @staticmethod
+    def _device_password(device):
+        """读取设备记录里的密码 (可能是 DPAPI 密文)"""
+        from config import unprotect_secret
+        try:
+            return unprotect_secret(device.get('password', '') or '')
+        except Exception:
+            return device.get('password', '') or ''
+
     def _add_to_device_list(self, device_id, ip=None):
+        """把一次连接尝试记入设备列表。
+
+        注意: 这里 **不再** 无条件把设备标记为 online —— "点过连接"不等于"在线",
+        真正的在线状态由 _check_devices_online 探测 / 连接成功后的 update_device_ip 决定。
+        """
+        from config import protect_secret
         is_ip = '.' in device_id and device_id.replace('.', '').isdigit()
+        pwd = self.input_password.text()
 
-        for device in self._device_list:
-            id_match = device.get('id') == device_id
-            ip_match = ip and device.get('ip') == ip and ip != '局域网'
-            if is_ip and device.get('ip') == device_id:
-                ip_match = True
+        with self._device_lock:
+            for device in self._device_list:
+                id_match = device.get('id') == device_id
+                ip_match = ip and device.get('ip') == ip and ip != '局域网'
+                if is_ip and device.get('ip') == device_id:
+                    ip_match = True
 
-            if id_match or ip_match:
-                device['last_connected'] = datetime.now().isoformat()
-                if ip and ip != '局域网':
-                    device['ip'] = ip
-                if not is_ip:
-                    device['id'] = device_id
-                device['online'] = True
-                self._save_device_list()
-                return
+                if id_match or ip_match:
+                    device['last_connected'] = datetime.now().isoformat()
+                    if ip and ip != '局域网':
+                        device['ip'] = ip
+                    if not is_ip:
+                        device['id'] = device_id
+                    if pwd:
+                        # 每次连接都刷新密码, 否则对方改密后永远连不上且无提示
+                        device['password'] = protect_secret(pwd)
+                    self._save_device_list()
+                    return
 
-        self._device_list.append({
-            'id': device_id,
-            'name': f'设备 {device_id}',
-            'ip': ip or '局域网',
-            'online': True,
-            'favorite': False,
-            'last_connected': datetime.now().isoformat(),
-            'password': self.input_password.text(),
-        })
-        self._save_device_list()
-
-    def _update_device_ip(self, device_id, ip):
-        for device in self._device_list:
-            if device.get('id') == device_id:
-                device['ip'] = ip
-                device['online'] = True
-                self._save_device_list()
-                return
+            self._device_list.append({
+                'id': device_id,
+                'name': f'设备 {device_id}',
+                'ip': ip or '局域网',
+                'online': False,
+                'favorite': False,
+                'last_connected': datetime.now().isoformat(),
+                'password': protect_secret(pwd) if pwd else '',
+            })
+            self._save_device_list()
 
     def _check_devices_online(self):
-        for device in self._device_list:
-            ip = device.get('ip', '')
-            if not ip or ip == '局域网':
-                continue
-            host = ip.split(':')[0] if ':' in ip else ip
-            try:
-                sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                sock.settimeout(1.0)
-                result = sock.connect_ex((host, 7788))
-                sock.close()
-                if result == 0:
-                    self._online_devices.add(device.get('id'))
+        """探测设备在线状态 (在工作线程中调用)
+
+        修正两点:
+          1. 端口取设备记录里的真实端口 (device['ip'] 形如 "1.2.3.4:7789"),
+             旧实现硬编码 7788 —— 端口漂移过的设备会永远显示离线。
+          2. 并发探测 + 单设备短超时, 不会被一台离线设备拖住整轮。
+        """
+        with self._device_lock:
+            targets = []
+            for device in self._device_list:
+                ip = device.get('ip', '')
+                if not ip or ip == '局域网':
+                    continue
+                if ':' in ip:
+                    host, _, port_s = ip.partition(':')
+                    try:
+                        port = int(port_s)
+                    except ValueError:
+                        port = self._port
                 else:
-                    self._online_devices.discard(device.get('id'))
+                    host, port = ip, self._port
+                targets.append((device.get('id'), host, port))
+
+        if not targets:
+            return
+
+        results = {}
+        res_lock = threading.Lock()
+
+        def probe(dev_id, host, port):
+            ok = False
+            s = None
+            try:
+                s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                s.settimeout(1.5)
+                ok = (s.connect_ex((host, port)) == 0)
             except Exception:
-                self._online_devices.discard(device.get('id'))
+                ok = False
+            finally:
+                if s is not None:
+                    try:
+                        s.close()
+                    except Exception:
+                        pass
+            with res_lock:
+                results[dev_id] = ok
+
+        threads = []
+        for dev_id, host, port in targets:
+            t = threading.Thread(target=probe, args=(dev_id, host, port), daemon=True)
+            t.start()
+            threads.append(t)
+        for t in threads:
+            t.join(timeout=3.0)
+
+        for dev_id, is_online in results.items():
+            if is_online:
+                self._online_devices.add(dev_id)
+            else:
+                self._online_devices.discard(dev_id)
 
     def _refresh_password(self):
         self._my_password = self._generate_password()
@@ -752,20 +862,38 @@ class MainWindow(QMainWindow):
             QMessageBox.information(self, '设置成功', f'访问密码已更新为: {self._my_password}')
 
     def _format_id(self, id_str):
-        if len(id_str) >= 9:
+        if len(id_str) == 9:
             return f'{id_str[:3]} {id_str[3:6]} {id_str[6:]}'
         return id_str
 
     def _get_local_ip(self):
+        """获取本机局域网 IP (只解析一次并缓存; socket 无论成败都会关闭)"""
+        if self._local_ip is not None:
+            return self._local_ip
+        ip = None
+        s = None
         try:
             s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
             s.settimeout(1.0)
             s.connect(('8.8.8.8', 80))
             ip = s.getsockname()[0]
-            s.close()
-            return ip
         except Exception:
-            return '127.0.0.1'
+            ip = None
+        finally:
+            if s is not None:
+                try:
+                    s.close()
+                except Exception:
+                    pass
+        if not ip:
+            # 退一步: 枚举本机地址, 取第一个非回环
+            try:
+                from network import get_lan_ip
+                ip = get_lan_ip()
+            except Exception:
+                ip = None
+        self._local_ip = ip or '未知(无网络)'
+        return self._local_ip
 
     def _copy_to_clipboard(self, text):
         clipboard = QApplication.clipboard()
@@ -774,21 +902,55 @@ class MainWindow(QMainWindow):
     def _start_discovery(self):
         self._discover_timer = QTimer(self)
         self._discover_timer.timeout.connect(self._discover_devices)
-        self._discover_timer.start(3000)
+        self._discover_timer.start(5000)
 
     def _discover_devices(self):
+        """启动一轮后台探测 (带防重入: 上一轮没结束就不起新的)"""
+        if self._scanning:
+            return
+        self._scanning = True
+
         def _do_check():
-            self._check_devices_online()
-            for device in self._device_list:
-                device['online'] = device.get('id') in self._online_devices
-            QTimer.singleShot(0, self._refresh_devices_page)
+            try:
+                self._check_devices_online()
+                with self._device_lock:
+                    for device in self._device_list:
+                        device['online'] = device.get('id') in self._online_devices
+                # 只 emit 信号, 由 GUI 线程刷新界面 (不能在这里碰控件)
+                self.devices_refreshed.emit()
+            except Exception as e:
+                debug_log(f'[UI] 设备探测异常: {e}', 'ui')
+            finally:
+                self._scanning = False
 
         threading.Thread(target=_do_check, daemon=True).start()
 
-    def _update_latency(self):
-        self._latency = 10 + (hash(str(time.time())) % 20)
-        self.lbl_latency.setText(f'延迟: {self._latency}ms')
+    def _on_devices_refreshed(self):
+        """GUI 线程: 后台探测完成后刷新界面"""
+        try:
+            if self._stack.currentIndex() == 1:
+                self._refresh_devices_page()
+            self._refresh_recent_devices()
+        except Exception as e:
+            debug_log(f'[UI] 刷新设备界面异常: {e}', 'ui')
 
+    def _update_latency(self):
+        """显示真实 RTT (由当前会话的 Controller 心跳测量); 无会话时显示 --"""
+        ms = None
+        try:
+            if self._rtt_source is not None:
+                ms = self._rtt_source()
+        except Exception:
+            ms = None
+
+        if ms is None:
+            self._latency = 0
+            self.lbl_latency.setText('延迟: --ms')
+            self.lbl_latency.setStyleSheet('color: #999; font-size: 13px; margin-right: 15px;')
+            return
+
+        self._latency = int(round(ms))
+        self.lbl_latency.setText(f'延迟: {self._latency}ms')
         if self._latency < 50:
             self.lbl_latency.setStyleSheet('color: #52c41a; font-size: 13px; margin-right: 15px;')
         elif self._latency < 100:
@@ -806,11 +968,11 @@ class MainWindow(QMainWindow):
     def _refresh_current_page(self):
         idx = self._stack.currentIndex()
         if idx == 0:
-            self._stack.setCurrentIndex(1)
-            self._refresh_devices_page()
-            self._stack.setCurrentIndex(0)
+            self._refresh_recent_devices()
         elif idx == 1:
             self._refresh_devices_page()
+        elif idx == 2:
+            self._reload_settings_page()
 
     # ============ 设备列表页面 ============
     def _build_devices_page(self):
@@ -908,28 +1070,14 @@ class MainWindow(QMainWindow):
         self.btn_action_file.clicked.connect(lambda: self._connect_detail_device('file'))
         btn_row.addWidget(self.btn_action_file)
 
-        self.btn_action_terminal = QPushButton('终端')
-        self.btn_action_terminal.setFixedHeight(32)
-        self.btn_action_terminal.setStyleSheet('background-color: white; color: #333; border: 1px solid #d9d9d9; border-radius: 6px; padding: 4px 16px; font-size: 12px;')
-        self.btn_action_terminal.setCursor(Qt.PointingHandCursor)
-        self.btn_action_terminal.setEnabled(False)
-        self.btn_action_terminal.clicked.connect(lambda: self._connect_detail_device('terminal'))
-        btn_row.addWidget(self.btn_action_terminal)
-
-        self.btn_action_restart = QPushButton('重启设备')
-        self.btn_action_restart.setFixedHeight(32)
-        self.btn_action_restart.setStyleSheet('background-color: white; color: #faad14; border: 1px solid #ffe58f; border-radius: 6px; padding: 4px 16px; font-size: 12px;')
-        self.btn_action_restart.setCursor(Qt.PointingHandCursor)
-        self.btn_action_restart.setEnabled(False)
-        self.detail_actions_restart = self.btn_action_restart
-        btn_row.addWidget(self.btn_action_restart)
-
-        self.btn_action_shutdown = QPushButton('关机设备')
-        self.btn_action_shutdown.setFixedHeight(32)
-        self.btn_action_shutdown.setStyleSheet('background-color: white; color: #ff4d4f; border: 1px solid #ffa39e; border-radius: 6px; padding: 4px 16px; font-size: 12px;')
-        self.btn_action_shutdown.setCursor(Qt.PointingHandCursor)
-        self.btn_action_shutdown.setEnabled(False)
-        btn_row.addWidget(self.btn_action_shutdown)
+        self.btn_action_view = QPushButton('仅观看')
+        self.btn_action_view.setFixedHeight(32)
+        self.btn_action_view.setStyleSheet('background-color: white; color: #333; border: 1px solid #d9d9d9; border-radius: 6px; padding: 4px 16px; font-size: 12px;')
+        self.btn_action_view.setCursor(Qt.PointingHandCursor)
+        self.btn_action_view.setEnabled(False)
+        self.btn_action_view.setToolTip('只查看画面, 不向对方发送键鼠操作')
+        self.btn_action_view.clicked.connect(lambda: self._connect_detail_device('view'))
+        btn_row.addWidget(self.btn_action_view)
 
         self.btn_action_delete = QPushButton('🗑 删除设备')
         self.btn_action_delete.setFixedHeight(32)
@@ -959,8 +1107,11 @@ class MainWindow(QMainWindow):
                 item.widget().deleteLater()
 
         search_text = self.input_search.text().strip() if hasattr(self, 'input_search') else ''
-        filtered = [d for d in self._device_list
-                    if not search_text or search_text in d.get('id', '') or search_text in d.get('name', '')]
+        with self._device_lock:
+            snapshot = list(self._device_list)
+        filtered = [d for d in snapshot
+                    if not search_text or search_text in d.get('id', '')
+                    or search_text in d.get('name', '')]
 
         if not filtered:
             empty_label = QLabel('📭 暂无设备，请在主页添加')
@@ -1063,13 +1214,13 @@ class MainWindow(QMainWindow):
         self.lbl_detail_status.setStyleSheet('font-size: 12px; color: #52c41a;' if is_online else 'font-size: 12px; color: #999;')
 
         for btn in [self.btn_action_control, self.btn_action_file,
-                    self.btn_action_terminal, self.btn_action_restart,
-                    self.btn_action_shutdown, self.btn_action_delete]:
+                    self.btn_action_view, self.btn_action_delete]:
             btn.setEnabled(True)
 
     def _toggle_favorite(self, device):
-        device['favorite'] = not device.get('favorite', False)
-        self._save_device_list()
+        with self._device_lock:
+            device['favorite'] = not device.get('favorite', False)
+            self._save_device_list()
         self._refresh_devices_page()
 
     def _confirm_remove_device(self, device):
@@ -1085,69 +1236,96 @@ class MainWindow(QMainWindow):
             self._remove_device(device)
 
     def _remove_device(self, device):
-        if device in self._device_list:
-            self._device_list.remove(device)
-        self._save_device_list()
+        with self._device_lock:
+            if device in self._device_list:
+                self._device_list.remove(device)
+            self._save_device_list()
+        # 该设备的连接历史也一并清掉, 否则历史下拉里还留着已删设备
+        try:
+            remove_history(device.get('id', ''))
+        except Exception:
+            pass
         if self._current_detail_device is device:
-            self._current_detail_device = None
-            self.lbl_detail_name.setText('请选择设备')
-            self.lbl_detail_id.setText('')
-            self.lbl_detail_ip.setText('')
-            self.lbl_detail_status.setText('')
-            for btn in [self.btn_action_control, self.btn_action_file,
-                        self.btn_action_terminal, self.btn_action_restart,
-                        self.btn_action_shutdown, self.btn_action_delete]:
-                btn.setEnabled(False)
+            self._clear_detail_panel()
         self._refresh_devices_page()
-        self._refresh_home_page()
+        self._refresh_recent_devices()
 
     def _clear_all_devices(self):
-        if not self._device_list:
+        with self._device_lock:
+            count = len(self._device_list)
+        if not count:
             return
         ret = QMessageBox.question(
             self, '清空设备列表',
-            f'确定要清空全部 {len(self._device_list)} 条设备记录吗？\n此操作不可恢复！',
+            f'确定要清空全部 {count} 条设备记录吗？\n此操作不可恢复！',
             QMessageBox.Yes | QMessageBox.No
         )
         if ret == QMessageBox.Yes:
-            self._device_list.clear()
-            self._save_device_list()
+            with self._device_lock:
+                self._device_list.clear()
+                self._save_device_list()
             self._current_detail_device = None
-            self.lbl_detail_name.setText('请选择设备')
-            self.lbl_detail_id.setText('')
-            self.lbl_detail_ip.setText('')
-            self.lbl_detail_status.setText('')
-            for btn in [self.btn_action_control, self.btn_action_file,
-                        self.btn_action_terminal, self.btn_action_restart,
-                        self.btn_action_shutdown, self.btn_action_delete]:
-                btn.setEnabled(False)
+            self._clear_detail_panel()
             self._refresh_devices_page()
-            self._refresh_home_page()
+            self._refresh_recent_devices()
+
+    def _clear_detail_panel(self):
+        self._current_detail_device = None
+        self.lbl_detail_name.setText('请选择设备')
+        self.lbl_detail_id.setText('')
+        self.lbl_detail_ip.setText('')
+        self.lbl_detail_status.setText('')
+        for btn in [self.btn_action_control, self.btn_action_file,
+                    self.btn_action_view, self.btn_action_delete]:
+            btn.setEnabled(False)
+
+    def _refresh_recent_devices(self):
+        """只刷新"最近连接"列表。
+
+        旧实现 _refresh_home_page() 会 removeWidget + deleteLater + 整页重建,
+        副作用是: 用户已填好的设备ID/密码被清空、_current_mode 与显示不一致、
+        每次都要重跑一次阻塞式取IP。这里改为局部刷新。
+        """
+        try:
+            if not hasattr(self, 'recent_layout'):
+                return
+            while self.recent_layout.count():
+                item = self.recent_layout.takeAt(0)
+                w = item.widget()
+                if w is not None and w is not self.recent_empty_label:
+                    w.deleteLater()
+            with self._device_lock:
+                devices = list(self._device_list[:5])
+            if not devices:
+                self.recent_empty_label.setVisible(True)
+                self.recent_layout.addWidget(self.recent_empty_label)
+            else:
+                self.recent_empty_label.setVisible(False)
+                for device in devices:
+                    self.recent_layout.addWidget(self._create_recent_device_item(device))
+            self.recent_layout.addStretch()
+        except Exception as e:
+            debug_log(f'[UI] 刷新最近连接失败: {e}', 'ui')
 
     def _refresh_home_page(self):
-        old = self._stack.widget(0)
-        current = self._stack.currentWidget()
-        if old is not None:
-            self._stack.removeWidget(old)
-            old.deleteLater()
-        self._stack.insertWidget(0, self._build_home_page())
-        if current is old or current is None:
-            self._stack.setCurrentIndex(0)
-        else:
-            self._stack.setCurrentWidget(current)
+        """保留旧名字作为兼容入口"""
+        self._refresh_recent_devices()
 
     def _connect_detail_device(self, mode):
         if not self._current_detail_device:
             return
 
         device_id = self._current_detail_device.get('id', '')
-        password = self._current_detail_device.get('password', '')
+        password = self._device_password(self._current_detail_device)
 
         if not password:
-            QMessageBox.question(self, '需要密码', '该设备需要访问密码，请在主页输入密码后连接。',
-                                 QMessageBox.Ok)
+            QMessageBox.information(self, '需要密码',
+                                    '该设备还没有保存密码，请在主页输入密码后连接。')
             return
 
+        self.set_connect_status(f'⏳ 正在连接 {device_id} ...')
+        self.btn_connect.setEnabled(False)
+        self.btn_connect.setText('连接中...')
         self.connect_requested.emit(device_id, mode, password)
 
     # ============ 高级设置页面 ============
@@ -1225,17 +1403,25 @@ class MainWindow(QMainWindow):
 
         self.spn_port = QSpinBox()
         self.spn_port.setRange(1024, 65535)
-        self.spn_port.setValue(self._get_setting('port', 7788))
+        self.spn_port.setValue(int(self._get_setting('port', 7788)))
+        self.spn_port.setToolTip('被控端监听端口。修改后需要重启 MyDesk 才生效。')
         form3.addRow('监听端口:', self.spn_port)
 
-        self.chk_lan_only = ToggleSwitch('仅局域网模式')
-        self.chk_lan_only.setChecked(self._get_setting('lan_only', False))
+        self.chk_lan_only = ToggleSwitch('仅允许局域网/私有地址连接')
+        self.chk_lan_only.setChecked(bool(self._get_setting('lan_only', False)))
+        self.chk_lan_only.setToolTip(
+            '开启后, 被控端会拒绝来自公网/非私有地址的连接请求。')
         form3.addRow(self.chk_lan_only)
 
-        self.cmb_encryption = QComboBox()
-        self.cmb_encryption.addItems(['AES-256', 'AES-128', '无加密'])
-        self.cmb_encryption.setCurrentIndex(self._get_setting('encryption', 0))
-        form3.addRow('加密方式:', self.cmb_encryption)
+        # 加密方式: 项目目前没有实现任何加密, 之前这里放了一个
+        # "AES-256/AES-128/无加密" 下拉框纯属误导, 已移除并改为如实说明。
+        enc_note = QLabel(
+            '⚠️ 数据传输未加密：认证已用挑战-响应防重放, 但画面/输入/文件是明文。\n'
+            '    请只在可信网络（局域网 / Tailscale 等加密隧道）中使用。')
+        enc_note.setWordWrap(True)
+        enc_note.setStyleSheet('color: #d46b08; font-size: 12px; '
+                               'background: #fff7e6; padding: 8px; border-radius: 6px;')
+        form3.addRow(enc_note)
 
         group3.setLayout(form3)
         connect_layout.addWidget(group3)
@@ -1250,9 +1436,15 @@ class MainWindow(QMainWindow):
         group4 = QGroupBox('画质设置')
         form4 = QFormLayout()
 
+        # 画质直接对应 JPEG 质量, 不再用"流畅/清晰/高清"这类与实现脱节的说法
         self.cmb_quality = QComboBox()
-        self.cmb_quality.addItems(['流畅 (低)', '清晰 (中)', '高清 (高)', '原画 (极致)'])
-        self.cmb_quality.setCurrentIndex(self._get_setting('quality', 2))
+        self.cmb_quality.addItems([
+            '省流量 (JPEG 40)', '流畅 (JPEG 55)', '清晰 (JPEG 75)', '高清 (JPEG 90)'])
+        self._quality_values = [40, 55, 75, 90]
+        cur_q = int(self._get_setting('quality', 65))
+        self.cmb_quality.setCurrentIndex(
+            min(range(len(self._quality_values)),
+                key=lambda i: abs(self._quality_values[i] - cur_q)))
         form4.addRow('默认画质:', self.cmb_quality)
 
         self.cmb_fps = QComboBox()
@@ -1261,7 +1453,9 @@ class MainWindow(QMainWindow):
         form4.addRow('帧率上限:', self.cmb_fps)
 
         self.chk_auto_quality = ToggleSwitch('根据网络自动调整画质')
-        self.chk_auto_quality.setChecked(self._get_setting('auto_quality', True))
+        self.chk_auto_quality.setChecked(False)
+        self.chk_auto_quality.setEnabled(False)
+        self.chk_auto_quality.setToolTip('暂未实现（需要带宽/丢包测量）, 保留占位以免误导')
         form4.addRow(self.chk_auto_quality)
 
         group4.setLayout(form4)
@@ -1277,24 +1471,27 @@ class MainWindow(QMainWindow):
         group5 = QGroupBox('安全设置')
         form5 = QFormLayout()
 
-        self.edit_access_password = QLineEdit(self._get_setting('access_password', ''))
-        self.edit_access_password.setPlaceholderText('设置访问密码')
-        self.edit_access_password.setEchoMode(QLineEdit.Password)
-        self.edit_access_password.setFixedHeight(36)
-        form5.addRow('访问密码:', self.edit_access_password)
+        pwd_note = QLabel(
+            '连接密码请在「远程控制」页用「编辑 / 刷新」按钮修改。\n'
+            '密码以 DPAPI 加密后存放在本机配置里, 明文不再落盘。')
+        pwd_note.setWordWrap(True)
+        pwd_note.setStyleSheet('color: #666; font-size: 12px;')
+        form5.addRow(pwd_note)
 
-        self.chk_two_factor = ToggleSwitch('启用二次验证（连接时需确认）')
-        self.chk_two_factor.setChecked(self._get_setting('two_factor', False))
-        form5.addRow(self.chk_two_factor)
-
-        self.chk_ip_whitelist = ToggleSwitch('仅允许白名单IP连接')
-        self.chk_ip_whitelist.setChecked(self._get_setting('ip_whitelist', False))
+        self.chk_ip_whitelist = ToggleSwitch('仅允许白名单 IP 连接')
+        self.chk_ip_whitelist.setChecked(bool(self._get_setting('ip_whitelist', False)))
         form5.addRow(self.chk_ip_whitelist)
 
         self.edit_whitelist = QLineEdit(self._get_setting('whitelist_ips', ''))
-        self.edit_whitelist.setPlaceholderText('多个IP用逗号分隔')
+        self.edit_whitelist.setPlaceholderText('多个 IP 前缀用逗号分隔, 例如 192.168.1.,10.0.0.5')
         self.edit_whitelist.setFixedHeight(36)
-        form5.addRow('白名单IP:', self.edit_whitelist)
+        form5.addRow('白名单 IP:', self.edit_whitelist)
+
+        self.chk_two_factor = ToggleSwitch('连接前需要被控端确认')
+        self.chk_two_factor.setChecked(False)
+        self.chk_two_factor.setEnabled(False)
+        self.chk_two_factor.setToolTip('暂未实现, 保留占位以免误导')
+        form5.addRow(self.chk_two_factor)
 
         group5.setLayout(form5)
         security_layout.addWidget(group5)
@@ -1321,42 +1518,76 @@ class MainWindow(QMainWindow):
         return outer
 
     def _get_setting(self, key, default=None):
+        """读取用户设置 (走 config 的缓存 + 原子写实现)"""
         try:
-            file_path = os.path.join(DATA_DIR, 'settings.json')
-            if os.path.exists(file_path):
-                with open(file_path, 'r', encoding='utf-8') as f:
-                    settings = json.load(f)
-                return settings.get(key, default)
+            from config import get_setting
+            return get_setting(key, default)
         except Exception:
-            pass
-        return default
+            return default
+
+    def _reload_settings_page(self):
+        """把设置页的控件重新按磁盘上的值填充 (供顶栏 🔄 使用)"""
+        try:
+            self.chk_autostart.setChecked(bool(self._get_setting('autostart', False)))
+            self.chk_prevent_sleep.setChecked(bool(self._get_setting('prevent_sleep', True)))
+            self.chk_show_tray.setChecked(bool(self._get_setting('show_tray', True)))
+            self.edit_save_path.setText(self._get_setting('save_path', ''))
+            self.spn_port.setValue(int(self._get_setting('port', 7788)))
+            self.chk_lan_only.setChecked(bool(self._get_setting('lan_only', False)))
+            cur_q = int(self._get_setting('quality', 65))
+            self.cmb_quality.setCurrentIndex(
+                min(range(len(self._quality_values)),
+                    key=lambda i: abs(self._quality_values[i] - cur_q)))
+            self.cmb_fps.setCurrentText(str(self._get_setting('fps', 30)))
+            self.chk_ip_whitelist.setChecked(bool(self._get_setting('ip_whitelist', False)))
+            self.edit_whitelist.setText(self._get_setting('whitelist_ips', ''))
+        except Exception as e:
+            debug_log(f'[UI] 重新加载设置失败: {e}', 'ui')
 
     def _save_settings(self):
         try:
-            os.makedirs(DATA_DIR, exist_ok=True)
-            file_path = os.path.join(DATA_DIR, 'settings.json')
-            settings = {
+            settings = dict(load_settings())
+            settings.update({
                 'autostart': self.chk_autostart.isChecked(),
                 'prevent_sleep': self.chk_prevent_sleep.isChecked(),
                 'show_tray': self.chk_show_tray.isChecked(),
-                'save_path': self.edit_save_path.text(),
+                'save_path': self.edit_save_path.text().strip(),
                 'port': self.spn_port.value(),
                 'lan_only': self.chk_lan_only.isChecked(),
-                'encryption': self.cmb_encryption.currentIndex(),
-                'quality': self.cmb_quality.currentIndex(),
+                'quality': self._quality_values[self.cmb_quality.currentIndex()],
                 'fps': int(self.cmb_fps.currentText()),
-                'auto_quality': self.chk_auto_quality.isChecked(),
-                'access_password': self.edit_access_password.text(),
-                'two_factor': self.chk_two_factor.isChecked(),
+                'auto_quality': False,       # 未实现, 恒为 False
+                'two_factor': False,         # 未实现, 恒为 False
                 'ip_whitelist': self.chk_ip_whitelist.isChecked(),
-                'whitelist_ips': self.edit_whitelist.text(),
-            }
-            with open(file_path, 'w', encoding='utf-8') as f:
-                json.dump(settings, f, ensure_ascii=False, indent=2)
+                'whitelist_ips': self.edit_whitelist.text().strip(),
+            })
+            save_settings(settings)
 
-            QMessageBox.information(self, '成功', '✅ 设置已保存！')
+            # 开机自启: 真的去写/删注册表 Run 键 (旧版勾了没有任何作用)
+            self._apply_autostart(settings['autostart'])
+
+            QMessageBox.information(
+                self, '成功',
+                '✅ 设置已保存！\n\n'
+                f'监听端口: {settings["port"]}（重启 MyDesk 后生效）\n'
+                f'开机自启: {"已开启" if settings["autostart"] else "已关闭"}\n'
+                f'默认保存路径: {settings["save_path"]}')
         except Exception as e:
             QMessageBox.critical(self, '错误', f'保存设置失败: {e}')
+
+    def _apply_autostart(self, enabled):
+        """把"开机自启"落到注册表 (失败只提示, 不影响其它设置)"""
+        try:
+            from autostart import (is_installed_registry, install_registry,
+                                   uninstall_registry)
+            if enabled and not is_installed_registry():
+                install_registry()
+            elif not enabled and is_installed_registry():
+                uninstall_registry()
+        except Exception as e:
+            debug_log(f'[UI] 配置开机自启失败: {e}', 'ui')
+            QMessageBox.warning(self, '开机自启',
+                                f'开机自启设置失败(其它设置已保存): {e}')
 
     def _browse_save_path(self):
         path = QFileDialog.getExistingDirectory(self, '选择保存路径')
@@ -1414,45 +1645,88 @@ class MainWindow(QMainWindow):
             self._refresh_history()
 
     def _run_network_diagnostics(self):
-        """网络诊断: 检查本机IP / UDP广播 / TCP端口"""
+        """网络诊断: 放到后台线程执行, 结果通过信号回到 GUI 线程显示。
+
+        旧实现在 GUI 线程里做 DNS 解析 + 两个 2 秒超时的 socket, 最坏会让
+        界面冻结 4-6 秒; 而且 socket 只在成功分支关闭, 失败时泄漏句柄。
+        """
         debug_log('[诊断] 开始网络诊断', 'diag')
-        results = []
 
+        def worker():
+            results = []
+            diag_port = self._port
+
+            # 本机 IP
+            try:
+                results.append(f'✅ 本机IP: {self._get_local_ip()}')
+            except Exception as e:
+                results.append(f'❌ 本机IP获取失败: {e}')
+
+            # 被控端监听端口是否在听 (先看自己这台)
+            s = None
+            try:
+                s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                s.settimeout(2)
+                rc = s.connect_ex(('127.0.0.1', diag_port))
+                if rc == 0:
+                    results.append(f'✅ TCP 端口 {diag_port} 本地可达 (被控端已在监听)')
+                else:
+                    results.append(f'⚠️ TCP 端口 {diag_port} 本地不可达 (可能被控端未启动)')
+            except Exception as e:
+                results.append(f'❌ TCP检测异常: {e}')
+            finally:
+                if s is not None:
+                    try:
+                        s.close()
+                    except Exception:
+                        pass
+
+            # UDP 广播 (发现端口固定, 与可变 TCP 端口解耦)
+            s = None
+            try:
+                s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                s.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+                s.settimeout(2)
+                s.sendto(b'MyDesk-Diagnostic',
+                         ('255.255.255.255', get_discovery_port()))
+                results.append(f'✅ UDP 广播已发出 (发现端口 {get_discovery_port()})')
+            except PermissionError:
+                results.append('❌ UDP广播被拒绝 (权限不足)')
+            except OSError as e:
+                results.append(f'❌ UDP广播失败: {e}')
+            except Exception as e:
+                results.append(f'❌ UDP异常: {e}')
+            finally:
+                if s is not None:
+                    try:
+                        s.close()
+                    except Exception:
+                        pass
+
+            # 已记录设备里在线的情况
+            try:
+                with self._device_lock:
+                    devices = list(self._device_list)
+                online = [d.get('id', '?') for d in devices
+                          if d.get('id') in self._online_devices]
+                if devices:
+                    results.append(f'ℹ️ 设备列表: 共 {len(devices)} 台, '
+                                   f'在线 {len(online)} 台'
+                                   + (f' ({", ".join(online)})' if online else ''))
+            except Exception as e:
+                results.append(f'⚠️ 设备状态统计失败: {e}')
+
+            text = ('网络诊断结果:\n\n' + '\n'.join(results)
+                    + f'\n\n本机设备ID: {self._my_device_id}'
+                    + f'\n日志目录: {LOG_DIR}')
+            debug_log(f'[诊断] 结果: {text}', 'diag')
+            self.diagnostics_ready.emit(text)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _on_diagnostics_ready(self, text):
+        """GUI 线程: 显示诊断结果"""
         try:
-            hostname = socket.gethostname()
-            local_ip = socket.gethostbyname(hostname)
-            results.append(f'✅ 本机IP: {local_ip}')
+            QMessageBox.information(self, '网络诊断', text)
         except Exception as e:
-            results.append(f'❌ 本机IP获取失败: {e}')
-
-        try:
-            test_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            test_sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
-            test_sock.settimeout(2)
-            test_sock.sendto(b'MyDesk-Diagnostic', ('255.255.255.255', self._port + 1))
-            results.append('✅ UDP广播发送成功')
-            test_sock.close()
-        except socket.timeout:
-            results.append('⚠️ UDP广播超时 (可能被防火墙阻止)')
-        except PermissionError:
-            results.append('❌ UDP广播被拒绝 (权限不足)')
-        except OSError as e:
-            results.append(f'❌ UDP广播失败: {e}')
-        except Exception as e:
-            results.append(f'❌ UDP异常: {e}')
-
-        try:
-            test_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            test_sock.setTimeout(2) if hasattr(test_sock, 'setTimeout') else test_sock.settimeout(2)
-            result = test_sock.connect_ex(('127.0.0.1', self._port))
-            if result == 0:
-                results.append(f'✅ TCP端口 {self._port} 本地可达')
-            else:
-                results.append(f'⚠️ TCP端口 {self._port} 本地不可达 (可能未运行)')
-            test_sock.close()
-        except Exception as e:
-            results.append(f'❌ TCP检测异常: {e}')
-
-        diag_msg = '网络诊断结果:\n\n' + '\n'.join(results) + f'\n\n日志目录: {LOG_DIR}'
-        debug_log(f'[诊断] 结果: {diag_msg}', 'diag')
-        QMessageBox.information(self, '网络诊断', diag_msg)
+            debug_log(f'[诊断] 显示结果失败: {e}', 'diag')

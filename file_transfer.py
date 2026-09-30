@@ -68,8 +68,15 @@ class FileTransfer:
         # 目录列表 / 删除结果的监听者 (多播, 替代原来"单属性互相覆盖"的写法)
         self._list_listeners = []
         self._remove_listeners = []
+        self._log_listeners = []
 
     def _log(self, msg):
+        # 多播: 状态栏 / 对话框进度条等可以有多个消费者
+        for fn in list(self._log_listeners):
+            try:
+                fn(msg)
+            except Exception:
+                pass
         try:
             self.on_log(msg)
         except Exception:
@@ -95,6 +102,14 @@ class FileTransfer:
     def remove_remove_listener(self, fn):
         if fn in self._remove_listeners:
             self._remove_listeners.remove(fn)
+
+    def add_log_listener(self, fn):
+        if fn not in self._log_listeners:
+            self._log_listeners.append(fn)
+
+    def remove_log_listener(self, fn):
+        if fn in self._log_listeners:
+            self._log_listeners.remove(fn)
 
     # ========== 主动发起 ==========
     def upload(self, filepath, remote_name=None):
