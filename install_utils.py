@@ -47,8 +47,14 @@ def get_uninstall_key():
     return r'Software\Microsoft\Windows\CurrentVersion\Uninstall\MyDesk'
 
 
-def register_uninstall(install_dir, exe_path, version='1.0.0'):
+def register_uninstall(install_dir, exe_path, version=None):
     """在注册表中注册卸载信息(控制面板可见)"""
+    if version is None:
+        try:
+            from config import VERSION as _v
+            version = _v
+        except Exception:
+            version = '1.0.0'
     key = get_uninstall_key()
     with winreg.CreateKey(winreg.HKEY_LOCAL_MACHINE, key) as k:
         winreg.SetValueEx(k, 'DisplayName', 0, winreg.REG_SZ, 'MyDesk 远程桌面')

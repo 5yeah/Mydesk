@@ -16,7 +16,7 @@ from config import (
     get_password, set_password, get_device_id, get_port, get_discovery_port,
     get_history, add_history, remove_history, clear_history,
     load_settings, save_settings, read_json, atomic_write_json,
-    DEVICE_LIST_FILE,
+    DEVICE_LIST_FILE, VERSION,
 )
 
 from PyQt5.QtCore import Qt, QTimer, pyqtSignal, QSize, QObject
@@ -180,7 +180,7 @@ class MainWindow(QMainWindow):
         logo_label.setAlignment(Qt.AlignCenter)
         sidebar_layout.addWidget(logo_label)
 
-        ver_label = QLabel('v1.0.0')
+        ver_label = QLabel(f'v{VERSION}')
         ver_label.setStyleSheet('color: #999; font-size: 12px; text-align: center;')
         ver_label.setAlignment(Qt.AlignCenter)
         sidebar_layout.addWidget(ver_label)

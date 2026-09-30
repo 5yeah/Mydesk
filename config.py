@@ -19,6 +19,9 @@ DEFAULT_PORT = 7788
 DISCOVERY_PORT = DEFAULT_PORT + 1  # UDP 设备发现固定端口 (与可变的 TCP 端口解耦)
 MAX_HISTORY = 20  # 最多保存20条历史记录
 
+# 版本号: 界面与卸载注册表都用它, 避免两处各写一份
+VERSION = '1.1.0'
+
 CONFIG_DIR = os.path.join(os.path.expanduser('~'), '.mydesk')
 CONFIG_FILE = os.path.join(CONFIG_DIR, 'config.json')
 
