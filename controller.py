@@ -218,6 +218,11 @@ class Controller:
             self.connected = False
             self.running = False
             self._gen += 1        # 让本代其它线程的回调失效
+        # 清理未完成的文件传输状态 (保留 .part 残文件以便续传)
+        try:
+            self.file_transfer.reset()
+        except Exception as e:
+            _debug_log(f'[Controller] 重置文件传输状态失败: {e}')
         for fn in list(self._disconnect_cbs):
             try:
                 fn()

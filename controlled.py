@@ -338,6 +338,7 @@ class Controlled:
             client_id = f'{addr[0]}#{self._client_counter}'
 
         authed = False
+        ft = None
         try:
             conn.settimeout(5)  # 认证超时
             msg = recv_msg(conn)
@@ -436,6 +437,12 @@ class Controlled:
             with self._clip_lock:
                 self._clip_sync_clients.discard(client_id)
                 self._clip_send_fns.pop(client_id, None)
+            if ft is not None:
+                # 清理未完成的接收状态 (保留 .part 残文件以便续传)
+                try:
+                    ft.reset()
+                except Exception as e:
+                    _debug_log(f'[被控端] 重置文件传输状态失败: {e}')
             if self._broadcaster:
                 # 已认证的才订阅过, 未认证的连接没有订阅, 不必触发订阅日志
                 if authed:
