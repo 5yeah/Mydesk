@@ -10,8 +10,10 @@ __pycache__/
 *.log
 _launch.log
 
-# ===== 本次审查/修复的临时探针与权限修复备份 =====
+# ===== 调试探针 / 工具工作区 (不入库) =====
 .acl-recovery/
+.workbuddy/
+.trae/
 
 # ===== 本地环境 =====
 .venv/
