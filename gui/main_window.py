@@ -128,6 +128,25 @@ class MainWindow(QMainWindow):
                     self._save_device_list()
                     return
 
+    def get_device_cached_addr(self, device_id):
+        """返回设备上次连接成功的 'ip:port' 缓存地址, 无则 None (线程安全)。
+
+        供快速重连使用: 先试该地址, 命中则跳过 UDP/TCP 设备发现(省 3-10 秒)。
+        """
+        try:
+            with self._device_lock:
+                for device in self._device_list:
+                    if device.get('id') == device_id:
+                        addr = str(device.get('ip') or '').strip()
+                        if not addr:
+                            return None
+                        if ':' not in addr:
+                            addr = f'{addr}:{get_port()}'
+                        return addr
+        except Exception as e:
+            debug_log(f'[UI] 读取设备缓存地址失败: {e}', 'ui')
+        return None
+
     def add_history_entry(self, target, password, host=None):
         """记录一条连接历史 (可能由后台线程调用)"""
         try:

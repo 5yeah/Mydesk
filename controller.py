@@ -109,6 +109,11 @@ class Controller:
                                  struct.pack('<i', int(SEND_TIMEOUT * 1000)))
         except Exception as e:
             _debug_log(f'[Controller] 设置发送超时失败(忽略): {e}')
+        # 关闭 Nagle: 键鼠输入是小包, 不关的话会被攒到上一帧确认后才发, 增加操作延迟
+        try:
+            self.sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        except Exception as e:
+            _debug_log(f'[Controller] 设置 TCP_NODELAY 失败(忽略): {e}')
 
         # Step 1: TCP 连接
         try:

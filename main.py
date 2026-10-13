@@ -187,10 +187,11 @@ class _AppBridge(QObject):
     用信号而不是 QTimer.singleShot: 信号走队列连接由 Qt 自动切回 GUI 线程,
     而 QTimer 在普通 threading.Thread 里创建后永远不会触发。
     """
-    session_ready = pyqtSignal(object, str)   # controller, mode
-    connect_failed = pyqtSignal(str, str)     # 标题, 消息
+    session_ready = pyqtSignal(object, str, int)  # controller, mode, 连接代
+    connect_failed = pyqtSignal(int, str, str)    # 连接代, 标题, 消息
     status_message = pyqtSignal(str)
-    session_closed = pyqtSignal()             # 连接断开(可能来自接收线程)
+    # 连接断开(可能来自接收线程); 携带断开的 controller 用于会话隔离
+    session_closed = pyqtSignal(object)
 
 
 class MyDeskApplication:
@@ -218,6 +219,10 @@ class MyDeskApplication:
             self.current_file_transfer = None
             self.tray = None
             self._closing = False
+            # 连接互斥与代际: 同一时刻只允许一个连接在跑,
+            # 过期连接的结果不得覆盖/杀死新连接 (二次连接卡"连接中"的根因之一)
+            self._connecting = False
+            self._connect_gen = 0
 
             # 后台线程 -> GUI 线程 的信号桥
             self._bridge = _AppBridge()
@@ -231,7 +236,9 @@ class MyDeskApplication:
             self.tray = SystemTray(
                 self.app,
                 self.main_window,
-                on_quick_connect=self.connect_to_device,
+                # 托盘快速连接也必须走 on_connect_requested:
+                # 旧版直接调 connect_to_device 会在 GUI 线程跑整个扫描+连接, 冻结界面
+                on_quick_connect=lambda d, p, m='control': self.on_connect_requested(d, m, p),
                 on_quit=self.quit,
             )
             # 无托盘会话(远程桌面/服务器): 关闭窗口即退出, 避免无窗口无托盘的"僵尸"进程
@@ -282,14 +289,45 @@ class MyDeskApplication:
 
     # ---- 连接调度 ----
     def on_connect_requested(self, device_id, mode, password):
-        debug_log(f'[MyDesk] 连接请求: {device_id}, mode={mode}')
+        # 连接单飞: 已有连接在跑时忽略重复请求
+        # (主页按钮禁用挡不住设备详情页/历史记录/托盘这些旁路入口)
+        if self._connecting:
+            debug_log(f'[MyDesk] 已有连接进行中, 忽略重复请求: {device_id}')
+            return
+        self._connecting = True
+        self._connect_gen += 1
+        gen = self._connect_gen
+        debug_log(f'[MyDesk] 连接请求 (gen={gen}): {device_id}, mode={mode}')
+
+        # 连接看门狗: 无论卡在设备发现/认证/信号投递哪一步,
+        # 到点强制作废本次连接并复位按钮 —— 按钮绝不会永久停在"连接中"
+        QTimer.singleShot(45000, lambda g=gen: self._on_connect_timeout(g))
+
         # 在后台线程中连接，避免阻塞UI
         def connect_worker():
             try:
-                self.connect_to_device(device_id, password, mode)
+                self.connect_to_device(device_id, password, mode, gen)
             except Exception as e:
-                debug_log(f'[MyDesk] 连接工作线程异常: {e}')
+                debug_log(f'[MyDesk] 连接工作线程异常: {e}\n{traceback.format_exc()}')
+                self._bridge.connect_failed.emit(gen, '连接失败', f'连接出错: {e}')
         threading.Thread(target=connect_worker, daemon=True).start()
+
+    def _on_connect_timeout(self, gen):
+        """看门狗到点: 本次连接仍无结果就作废它并复位界面 (GUI 线程)"""
+        if gen != self._connect_gen or not self._connecting:
+            return
+        debug_log(f'[MyDesk] 连接看门狗超时 (gen={gen}), 作废本次连接')
+        self._connect_gen += 1        # 让仍在跑的 worker 结果全部失效
+        self._connecting = False
+        try:
+            self.main_window.reset_connect_button()
+            self.main_window.set_connect_status('⚠️ 连接超时', error=True)
+        except Exception:
+            pass
+        QMessageBox.critical(
+            None, '连接超时',
+            '连接超时: 未能在限定时间内建立连接。\n\n'
+            '请检查网络, 或确认对方设备已启动并在线后重试。')
 
     def _on_status_message(self, text):
         try:
@@ -297,16 +335,31 @@ class MyDeskApplication:
         except Exception:
             pass
 
-    def _on_connect_failed(self, title, message):
+    def _on_connect_failed(self, gen, title, message):
         """在 GUI 线程弹出连接失败提示"""
+        if gen != self._connect_gen:
+            debug_log(f'[MyDesk] 丢弃过期连接失败结果 (gen={gen})')
+            return
+        self._connecting = False
+        debug_log(f'[MyDesk] 连接失败 (gen={gen}): {title} - {message[:300]}')
         try:
             self.main_window.reset_connect_button()
         except Exception:
             pass
         QMessageBox.critical(None, title, message)
 
-    def _on_session_ready(self, controller, mode):
+    def _on_session_ready(self, controller, mode, gen):
         """在 GUI 线程创建会话窗口 (唯一允许创建窗口的地方)"""
+        if gen != self._connect_gen:
+            # 过期连接(已被超时/新请求作废): 主动断开, 不许它打开窗口
+            debug_log(f'[MyDesk] 丢弃过期会话 (gen={gen}), 已断开')
+            try:
+                controller.disconnect()
+            except Exception:
+                pass
+            return
+        self._connecting = False
+        debug_log(f'[MyDesk] 连接成功 (gen={gen}), mode={mode}')
         try:
             self.main_window.reset_connect_button()
             if mode == 'file':
@@ -317,10 +370,21 @@ class MyDeskApplication:
             debug_log(f'[MyDesk] 打开会话异常: {e}\n{traceback.format_exc()}')
             QMessageBox.critical(None, '错误', f'打开会话失败: {e}')
 
-    def connect_to_device(self, device_id, password, mode='control'):
+    def connect_to_device(self, device_id, password, mode='control', gen=None):
         """在后台线程执行: 解析地址 -> 建立连接 -> 把结果 emit 回 GUI 线程"""
+        if gen is None:
+            gen = self._connect_gen
+
+        def emit_failed(title, msg):
+            self._bridge.connect_failed.emit(gen, title, msg)
+
+        def emit_status(text):
+            # 过期连接不许再改界面状态
+            if gen == self._connect_gen:
+                self._bridge.status_message.emit(text)
+
         try:
-            target_ip = None
+            direct_ip = None
             target_port = get_port()
 
             # 判断输入是 IP 还是设备ID
@@ -329,53 +393,83 @@ class MyDeskApplication:
                 try:
                     for p in ip_parts:
                         int(p)
-                    target_ip = device_id
-                    debug_log(f'[MyDesk] 直接使用IP连接: {target_ip}:{target_port}')
+                    direct_ip = device_id
+                    debug_log(f'[MyDesk] 直接使用IP连接: {direct_ip}:{target_port}')
                 except ValueError:
                     pass
 
             # 处理 IP:端口 格式
-            if not target_ip and ':' in device_id:
+            if not direct_ip and ':' in device_id:
                 parts = device_id.split(':', 1)
                 try:
                     ip_test = parts[0].split('.')
                     if len(ip_test) == 4 and all(p.isdigit() for p in ip_test):
-                        target_ip = parts[0]
+                        direct_ip = parts[0]
                         target_port = int(parts[1])
-                        debug_log(f'[MyDesk] 使用IP:端口连接: {target_ip}:{target_port}')
+                        debug_log(f'[MyDesk] 使用IP:端口连接: {direct_ip}:{target_port}')
                 except (ValueError, IndexError):
                     pass
 
-            # 如果不是IP，则通过设备ID查找
-            if not target_ip:
-                self._bridge.status_message.emit('正在查找设备...')
-                target_ip = self._find_device_ip(device_id)
-                if self._resolved_port:
-                    target_port = self._resolved_port
-
-            if not target_ip:
-                self._bridge.connect_failed.emit(
-                    '连接失败',
-                    f'无法找到设备: {device_id}\n\n请检查:\n'
-                    f'1. 设备ID是否正确\n'
-                    f'2. 对方设备是否已启动MyDesk\n'
-                    f'3. 两台设备是否在同一局域网\n'
-                    f'4. 尝试使用IP地址直接连接')
-                return
-
-            debug_log(f'[MyDesk] 连接到 {target_ip}:{target_port}')
-            self._bridge.status_message.emit(f'正在连接 {target_ip}:{target_port} ...')
-
-            controller = Controller()
-            try:
-                controller.connect(target_ip, target_port, password)
-            except Exception as e:
-                debug_log(f'[MyDesk] 连接异常: {e}')
-                self._bridge.connect_failed.emit('连接失败', f'连接出错: {e}')
+            # 构建候选地址列表:
+            #   IP输入 -> 只连该地址
+            #   设备ID -> 先试"上次连接成功的缓存地址"(秒连, 跳过发现),
+            #             缓存不通才跑 UDP广播+TCP子网扫描(3-10秒)
+            attempts = []
+            if direct_ip:
+                attempts.append((direct_ip, target_port, 'IP直连'))
+            else:
+                cached = None
                 try:
-                    controller.disconnect()
+                    cached = self.main_window.get_device_cached_addr(device_id)
                 except Exception:
-                    pass
+                    cached = None
+                if cached:
+                    try:
+                        c_ip, c_port = cached.rsplit(':', 1)
+                        attempts.append((c_ip, int(c_port), '缓存地址'))
+                        debug_log(f'[MyDesk] 使用缓存地址快速重连: {cached}')
+                    except ValueError:
+                        pass
+                attempts.append(None)   # 占位: 缓存失败后才执行设备发现
+
+            controller = None
+            target_ip = None
+            last_err = None
+            for item in attempts:
+                if item is None:
+                    emit_status('正在查找设备...')
+                    found_ip = self._find_device_ip(device_id)
+                    if not found_ip:
+                        continue
+                    item = (found_ip, self._resolved_port or target_port, '设备发现')
+                ip, port, src = item
+                debug_log(f'[MyDesk] 连接到 {ip}:{port} (来源: {src})')
+                emit_status(f'正在连接 {ip}:{port} ...')
+                c = Controller()
+                try:
+                    c.connect(ip, port, password)
+                    controller = c
+                    target_ip, target_port = ip, port
+                    break
+                except Exception as e:
+                    last_err = e
+                    debug_log(f'[MyDesk] 连接 {ip}:{port} 失败({src}): {e}')
+                    try:
+                        c.disconnect()
+                    except Exception:
+                        pass
+
+            if controller is None:
+                if last_err is None:
+                    emit_failed(
+                        '连接失败',
+                        f'无法找到设备: {device_id}\n\n请检查:\n'
+                        f'1. 设备ID是否正确\n'
+                        f'2. 对方设备是否已启动MyDesk\n'
+                        f'3. 两台设备是否在同一局域网\n'
+                        f'4. 尝试使用IP地址直接连接')
+                else:
+                    emit_failed('连接失败', f'连接出错: {last_err}')
                 return
 
             # 连接成功后更新设备IP (仅内存/文件操作, 不碰 Qt 控件)
@@ -390,10 +484,10 @@ class MyDeskApplication:
                 debug_log(f'[MyDesk] 写入历史记录失败: {e}')
 
             # 把结果投递回 GUI 线程创建窗口
-            self._bridge.session_ready.emit(controller, mode)
+            self._bridge.session_ready.emit(controller, mode, gen)
         except Exception as e:
             debug_log(f'[MyDesk] 连接异常: {e}\n{traceback.format_exc()}')
-            self._bridge.connect_failed.emit('连接失败', f'连接出错: {e}')
+            emit_failed('连接失败', f'连接出错: {e}')
 
     def _find_device_ip(self, device_id):
         """通过设备ID查找IP: UDP广播(快速) + TCP子网扫描(轻量回退)"""
@@ -515,9 +609,36 @@ class MyDeskApplication:
         debug_log('[MyDesk] TCP扫描未找到设备')
         return None
 
+    def _close_existing_session(self):
+        """打开新会话前先释放旧会话/旧控制器。
+
+        不先关旧窗口的话, 旧会话的断开回调会经 _cleanup_session
+        把刚建好的新会话杀掉 (日志实证: 新会话 3 秒后被旧回调断开)。
+        """
+        old_session = self.current_session
+        old_ft = self.current_file_transfer
+        old_ctrl = self.current_controller
+        # 先清空引用: 旧窗口 close() 期间触发的断开回调走 _cleanup_session 时
+        # 会因"身份不匹配"被直接忽略
+        self.current_session = None
+        self.current_file_transfer = None
+        self.current_controller = None
+        for w in (old_session, old_ft):
+            if w is not None:
+                try:
+                    w.close()
+                except Exception as e:
+                    debug_log(f'[MyDesk] 关闭旧会话窗口失败: {e}')
+        if old_ctrl is not None:
+            try:
+                old_ctrl.disconnect()
+            except Exception:
+                pass
+
     def _open_session(self, controller, mode='control'):
         try:
             debug_log('[MyDesk] 开始创建 ViewerWindow')
+            self._close_existing_session()
             self.current_controller = controller
             self.current_session = ViewerWindow(controller, mode=mode)
             self.current_session.setWindowTitle('MyDesk - 远程会话')
@@ -527,23 +648,25 @@ class MyDeskApplication:
 
             # 断线回调在接收线程触发 -> 用信号切回 GUI 线程
             # (绝不能用 QTimer.singleShot: 非 GUI 线程里创建的定时器永远不会触发)
-            controller.add_disconnect_callback(self._on_session_disconnected)
+            # 绑定具体 controller: 过期会话的回调不得清理新会话
+            controller.add_disconnect_callback(
+                lambda c=controller: self._bridge.session_closed.emit(c))
             self.main_window.start_latency_monitor()
             debug_log('[MyDesk] 会话已打开')
         except Exception as e:
             debug_log(f'[MyDesk] 打开会话异常: {e}\n{traceback.format_exc()}')
             QMessageBox.critical(None, '错误', f'打开会话失败: {e}')
 
-    def _on_session_disconnected(self):
-        """可能在接收线程被调用, 只做信号投递"""
-        debug_log('[MyDesk] 检测到会话断开')
-        try:
-            self._bridge.session_closed.emit()
-        except Exception:
-            pass
-
     def _open_file_transfer(self, controller):
         try:
+            # 先释放旧会话, 防止旧窗口回调杀掉本次文件传输会话
+            self._close_existing_session()
+            # 纯文件传输模式: 完全不需要画面, 让被控端别抓屏 (省掉全部画面开销)
+            try:
+                from protocol import MSG_CONTROL
+                controller.send(MSG_CONTROL, b'SCREEN_SELECT:-1')
+            except Exception:
+                pass
             recv_dir = get_setting('save_path')
             if not recv_dir:
                 recv_dir = os.path.join(os.path.expanduser('~'), 'Desktop', 'MyDesk_接收')
@@ -551,24 +674,29 @@ class MyDeskApplication:
             # 同步controller的接收目录
             controller.file_transfer.recv_dir = recv_dir
             self.current_controller = controller
-            self.current_file_transfer = FileTransferDialog(controller, recv_dir)
+            ft = FileTransferDialog(controller, recv_dir)
             # 上传/下载的发起包含 socket 写操作, 放到后台线程避免阻塞 GUI
-            self.current_file_transfer.file_upload_requested.connect(
+            ft.file_upload_requested.connect(
                 lambda p: threading.Thread(target=controller.upload_file,
                                            args=(p,), daemon=True).start())
-            self.current_file_transfer.file_download_requested.connect(
+            ft.file_download_requested.connect(
                 lambda n: threading.Thread(target=controller.download_file,
                                            args=(n,), daemon=True).start())
-            self.current_file_transfer.finished.connect(
-                lambda _code=0: self._on_file_transfer_closed())
-            self.current_file_transfer.resize(900, 600)
-            self.current_file_transfer.show()
+            ft.finished.connect(lambda _code=0, d=ft: self._on_file_transfer_closed(d))
+            ft.resize(900, 600)
+            self.current_file_transfer = ft
+            ft.show()
             debug_log('[MyDesk] 文件传输窗口已显示')
         except Exception as e:
             debug_log(f'[MyDesk] 文件传输异常: {e}\n{traceback.format_exc()}')
             QMessageBox.critical(None, '错误', f'文件传输失败: {e}')
 
-    def _on_file_transfer_closed(self):
+    def _on_file_transfer_closed(self, dlg=None):
+        # 会话隔离: 只有"当前"文件传输窗口关闭才允许清理当前会话,
+        # 否则被替换掉的旧窗口关闭时会误杀新会话
+        if dlg is not None and dlg is not self.current_file_transfer:
+            debug_log('[MyDesk] 忽略过期文件传输窗口关闭事件')
+            return
         if self.current_controller:
             try:
                 self.current_controller.disconnect()
@@ -577,7 +705,13 @@ class MyDeskApplication:
             self.current_controller = None
         self.current_file_transfer = None
 
-    def _cleanup_session(self):
+    def _cleanup_session(self, controller=None):
+        # 会话隔离: 只允许清理"当前"会话。
+        # 旧会话(可能已关闭/已被替换)的断开回调若不拦下, 会把新会话一起杀掉。
+        if controller is not None and controller is not self.current_controller:
+            debug_log('[MyDesk] 忽略过期会话断开回调 (会话隔离)')
+            return
+        debug_log('[MyDesk] 检测到会话断开, 清理会话')
         self.main_window.stop_latency_monitor()
         if self.current_controller:
             try:
@@ -647,11 +781,42 @@ def run_silent():
         server.stop()
 
 
+def run_agent():
+    """在交互用户会话中运行被控端代理。
+
+    由 windows_service.py 以当前活动会话用户身份拉起；不创建主界面，
+    只保留屏幕、输入、文件和网络服务。"""
+    from PyQt5.QtCore import QCoreApplication
+    app = QCoreApplication(sys.argv)
+    try:
+        import ctypes
+        ctypes.windll.user32.SetProcessDPIAware()
+    except Exception:
+        pass
+    server = Controlled(on_log=lambda m: debug_log(f'[会话代理] {m}'))
+    t = threading.Thread(target=server.start, daemon=True)
+    t.start()
+    try:
+        return app.exec_()
+    finally:
+        server.stop()
+
+
 def main():
     try:
         debug_log('main() 开始运行', 'startup')
 
         args = sys.argv[1:]
+        # pywin32 启动已安装服务时可能传入 -k ServiceName；安装/管理命令
+        # 则使用 --service。两种入口都必须绕过 Qt GUI。
+        if '--service' in args or '-k' in args:
+            # 服务命令由 pywin32 处理，避免服务进程创建 Qt 窗口。
+            from windows_service import service_cli
+            sys.argv = [sys.argv[0]] + [a for a in args if a != '--service']
+            service_cli()
+            return 0
+        if '--agent' in args:
+            return run_agent()
         silent = '--silent' in args
 
         if not acquire_single_instance():

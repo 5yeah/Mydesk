@@ -23,7 +23,12 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 PYI = [sys.executable, '-m', 'PyInstaller']
 
 HIDDEN = ['mss', 'PIL', 'pywin32', 'win32com', 'win32com.shell',
-          'win32com.shell.shellcon', 'pythoncom', 'win32crypt']
+          'win32com.shell.shellcon', 'pythoncom', 'win32crypt',
+          # dxcam 抓屏后端 (DXGI): comtypes 用于 COM 调用,
+          # _numpy_kernels 是颜色转换的编译内核 (字符串动态导入, 必须显式声明;
+          # 不打包 cv2, dxcam numpy 后端不依赖它, 省约 100MB)
+          'dxcam', 'dxcam.processor', 'dxcam.processor._numpy_kernels',
+          'comtypes']
 
 # conda 环境下 _ctypes 依赖 ffi DLL
 _FFI_DIR = os.path.join(os.path.dirname(sys.executable), 'Library', 'bin')
@@ -48,7 +53,8 @@ def build_main():
     # 仅作存在性核对 (PyInstaller 会从 main.py 自动收集 gui 包及依赖)
     for src in ['main.py', 'controller.py', 'controlled.py', 'screen_broadcaster.py',
                 'file_transfer.py', 'config.py', 'network.py', 'protocol.py',
-                'input_control.py', 'autostart.py', 'clipboard_win.py', 'server_ui.py']:
+                'input_control.py', 'autostart.py', 'clipboard_win.py',
+                'server_ui.py', 'windows_service.py']:
         if not os.path.exists(os.path.join(HERE, src)):
             print(f'[警告] 源文件缺失: {src}')
     args.append(os.path.join(HERE, 'main.py'))

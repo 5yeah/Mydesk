@@ -25,7 +25,7 @@ from protocol import (
     AUTH_V2_REQ, AUTH_V2_CHALLENGE, AUTH_V2_RESPONSE, AUTH_OK, AUTH_FAIL,
     make_nonce, auth_response,
     CTL_QUALITY, CTL_FPS, CTL_CLIPBOARD, CTL_PAUSE, CTL_RESUME, CTL_DEVICE_ID_QUERY,
-    CTL_SCREEN_INFO_REQ,
+    CTL_SCREEN_INFO_REQ, CTL_SCREEN_SELECT,
 )
 from config import (get_device_id, get_password, get_port, get_discovery_port,
                     CONFIG_FILE, load_config, load_settings)
@@ -255,6 +255,12 @@ class Controlled:
             conn.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
         except Exception as e:
             _debug_log(f'[被控端] 开启 SO_KEEPALIVE 失败: {e}')
+        # 关闭 Nagle: 光标/输入回执等小包夹在大帧之间时,
+        # 否则要等前一帧被确认才发, 白白多出几十毫秒延迟
+        try:
+            conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        except Exception as e:
+            _debug_log(f'[被控端] 设置 TCP_NODELAY 失败: {e}')
         # Windows: ioctl(SIO_KEEPALIVE_VALS, (启用, 空闲毫秒, 间隔毫秒))
         try:
             if hasattr(socket, 'SIO_KEEPALIVE_VALS'):
@@ -548,6 +554,10 @@ class Controlled:
                         handle_input(payload)
                     except Exception as e:
                         _debug_log(f'[被控端] [{client_id}] 输入执行异常: {e}')
+                # 主控端注入的输入也算"有人在操作", 用于解除空闲降频
+                # (GetLastInputInfo 只反映真实硬件输入, 看不到 SendInput)
+                if self._broadcaster:
+                    self._broadcaster.note_activity()
             elif mtype == MSG_FILE:
                 try:
                     ft.handle_message(payload)
@@ -588,6 +598,16 @@ class Controlled:
                 # 主控端窗口就绪后主动索要, 解决"显示器信息先于窗口到达被丢弃"
                 if client_id and self._broadcaster:
                     self._broadcaster.resend_screen_info(client_id)
+            elif cmd.startswith(CTL_SCREEN_SELECT):
+                # 客户端声明"我只看第 idx 块屏" -> 被控端只抓/只编那一块 (省一半开销)
+                try:
+                    idx = int(cmd.split(':', 1)[1])
+                except (ValueError, IndexError):
+                    idx = 0
+                if client_id and self._broadcaster:
+                    self._broadcaster.set_client_screen(client_id, idx)
+                    self.on_log(f'[被控端] [{client_id}] 显示屏幕 '
+                                f'{idx + 1 if idx >= 0 else "无(仅文件)"}')
             else:
                 _debug_log(f'[被控端] 未知控制指令: {cmd!r}')
         except Exception as e:

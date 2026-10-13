@@ -34,7 +34,7 @@ from protocol import (
     EV_MOUSE_MOVE, EV_MOUSE_DOWN, EV_MOUSE_UP, EV_MOUSE_SCROLL,
     EV_KEY_DOWN, EV_KEY_UP,
     CTL_QUALITY, CTL_FPS, CTL_CLIPBOARD, CTL_PAUSE, CTL_RESUME,
-    CTL_SCREEN_INFO_REQ,
+    CTL_SCREEN_INFO_REQ, CTL_SCREEN_SELECT,
 )
 from file_transfer import (
     FT_OFFER, FT_ACCEPT, FT_DATA, FT_DONE, FT_PULL, FT_ERROR,
@@ -1344,6 +1344,10 @@ class ViewerWindow(QMainWindow):
         except Exception:
             pass
 
+        # 告诉被控端"我只看第 screen_idx 块屏"。
+        # 这是最有效的一步省 CPU: 双屏机器上被控端不必再抓/编另一块屏(实测 ~50ms/帧)。
+        self._send_screen_select()
+
         # 会话期间阻止系统休眠 (可通过设置关闭)
         self._sleep_prevented = False
         try:
@@ -1380,6 +1384,15 @@ class ViewerWindow(QMainWindow):
             self._open_file_transfer()
         elif name == _SHORTCUT_PAUSE:
             self.btn_pause.setChecked(not self.btn_pause.isChecked())
+
+    def _send_screen_select(self):
+        """把"当前在看哪块屏"告诉被控端, 让它只抓/只编那一块"""
+        try:
+            self.controller.send(
+                MSG_CONTROL,
+                f'{CTL_SCREEN_SELECT}{self.screen_idx}'.encode('utf-8'))
+        except Exception:
+            pass
 
     def _on_cursor(self, x, y, visible):
         try:
@@ -1430,6 +1443,8 @@ class ViewerWindow(QMainWindow):
                 self.screen.set_remote_size(0, 0)
                 self.setWindowTitle(f'MyDesk 屏幕 {int(idx) + 1}')
             self.screen.update()
+            # 通知被控端切换抓屏目标 (旧屏幕停止编码, 新屏幕开始)
+            self._send_screen_select()
             self._focus_screen()
             self.status_label.setText(f'已切换到屏幕 {int(idx) + 1}')
         except Exception as e:

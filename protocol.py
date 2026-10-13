@@ -46,6 +46,10 @@ CTL_PAUSE = 'PAUSE'           # 暂停向本客户端推送画面
 CTL_RESUME = 'RESUME'         # 恢复
 CTL_DEVICE_ID_QUERY = 'DEVICE_ID_QUERY'  # 认证前查询设备ID(局域网 TCP 兜底发现)
 CTL_SCREEN_INFO_REQ = 'SCREEN_INFO_REQ'  # 主控端就绪后主动索要显示器信息(消除时序竞争)
+# SCREEN_SELECT:<idx> 告诉被控端"我只看第 idx 块屏", 被控端就只抓/只编那块屏。
+# idx = -1 表示"我完全不看画面"(例如只做文件传输), 被控端可以彻底停掉抓屏。
+CTL_SCREEN_SELECT = 'SCREEN_SELECT:'
+CTL_PROTO_VER = 'PROTO_VER'              # 探活/版本查询
 
 # 头部: 1 字节类型 + 4 字节载荷长度
 _HEADER = struct.Struct('<BI')

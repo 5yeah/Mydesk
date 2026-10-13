@@ -100,6 +100,38 @@ def uninstall_task_scheduler():
     return False
 
 
+# ---------- Windows 服务 ----------
+def install_service(exe_path=None):
+    """安装服务宿主；需要管理员权限。"""
+    import subprocess
+    if getattr(sys, 'frozen', False) or exe_path:
+        command = [os.path.abspath(exe_path or sys.executable)]
+    else:
+        command = [sys.executable, os.path.join(os.path.dirname(__file__), 'main.py')]
+    result = subprocess.run(command + ['--service', 'install'],
+                            capture_output=True, text=True)
+    if result.returncode == 0:
+        # 服务启动类型设为自动，并允许系统启动后延迟加载。
+        subprocess.run(command + ['--service', 'update', '--startup', 'auto'],
+                        capture_output=True, text=True)
+        return True
+    print(f'[服务] 安装失败: {(result.stderr or result.stdout).strip()}')
+    return False
+
+
+def uninstall_service(exe_path=None):
+    """卸载服务宿主；需要管理员权限。"""
+    import subprocess
+    if getattr(sys, 'frozen', False) or exe_path:
+        command = [os.path.abspath(exe_path or sys.executable)]
+    else:
+        command = [sys.executable, os.path.join(os.path.dirname(__file__), 'main.py')]
+    subprocess.run(command + ['--service', 'stop'], capture_output=True, text=True)
+    result = subprocess.run(command + ['--service', 'remove'],
+                            capture_output=True, text=True)
+    return result.returncode == 0
+
+
 # ---------- 静默运行 ----------
 def hide_console():
     """隐藏控制台窗口 (被控端静默运行)"""

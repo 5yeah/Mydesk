@@ -20,7 +20,7 @@ DISCOVERY_PORT = DEFAULT_PORT + 1  # UDP 设备发现固定端口 (与可变的 
 MAX_HISTORY = 20  # 最多保存20条历史记录
 
 # 版本号: 界面与卸载注册表都用它, 避免两处各写一份
-VERSION = '1.1.0'
+VERSION = '1.2.0'
 
 CONFIG_DIR = os.path.join(os.path.expanduser('~'), '.mydesk')
 CONFIG_FILE = os.path.join(CONFIG_DIR, 'config.json')
@@ -41,15 +41,24 @@ _config_mtime = None
 def _atomic_write_json(path, obj):
     """原子写 JSON: 先写临时文件再 os.replace, 避免读到半截文件"""
     os.makedirs(os.path.dirname(path) or '.', exist_ok=True)
-    tmp = path + '.tmp'
-    with open(tmp, 'w', encoding='utf-8') as f:
-        json.dump(obj, f, ensure_ascii=False, indent=2)
-        f.flush()
+    # 同一进程内虽有锁，但多个 MyDesk 进程/旧残留 .tmp 仍可能互相覆盖。
+    # 使用进程+线程唯一的临时名，最后一步仍保持同目录原子替换。
+    tmp = f'{path}.{os.getpid()}.{threading.get_ident()}.tmp'
+    try:
+        with open(tmp, 'w', encoding='utf-8') as f:
+            json.dump(obj, f, ensure_ascii=False, indent=2)
+            f.flush()
+            try:
+                os.fsync(f.fileno())
+            except OSError:
+                pass
+        os.replace(tmp, path)
+    finally:
         try:
-            os.fsync(f.fileno())
+            if os.path.exists(tmp):
+                os.remove(tmp)
         except OSError:
             pass
-    os.replace(tmp, path)
 
 
 def _read_json(path):

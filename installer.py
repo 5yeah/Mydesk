@@ -251,9 +251,20 @@ class InstallWorker(QThread):
                 except Exception as e:
                     print(f'开始菜单失败: {e}')
 
-            # 4. 开机自启 (带上 --silent, main.py 现在真的支持静默模式)
+            # 4. 优先安装 Windows 服务。服务负责跨登录/断线保活，
+            # 当前用户登录后由服务拉起会话代理；失败时保留 Run 键兜底。
+            service_ok = False
             if self.autostart:
-                self.progress.emit(88, '正在配置开机自启...')
+                self.progress.emit(88, '正在安装远程桌面后台服务...')
+                try:
+                    from autostart import install_service
+                    service_ok = install_service(dst_exe)
+                    if service_ok:
+                        subprocess.run([dst_exe, '--service', 'start'],
+                                       capture_output=True, text=True)
+                except Exception as e:
+                    print(f'后台服务安装失败: {e}')
+            if self.autostart and not service_ok:
                 try:
                     import winreg
                     cmd = f'"{dst_exe}" --silent'
@@ -307,6 +318,11 @@ class UninstallWorker(QThread):
         try:
             # 1. 关闭运行中的 MyDesk
             self.progress.emit(10, '正在关闭 MyDesk...')
+            try:
+                from autostart import uninstall_service
+                uninstall_service(os.path.join(self.install_dir, 'MyDesk.exe'))
+            except Exception as e:
+                print(f'后台服务卸载失败: {e}')
             subprocess.run(['taskkill', '/F', '/IM', 'MyDesk.exe'],
                           capture_output=True, text=True)
             self.progress.emit(30, 'MyDesk 已关闭')
